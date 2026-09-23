@@ -12,7 +12,7 @@ import uuid
 from .security import redact, summarize
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def utc_now() -> str:
@@ -56,7 +56,8 @@ class StateStore:
                 CREATE TABLE IF NOT EXISTS schema_info (version INTEGER NOT NULL);
                 CREATE TABLE IF NOT EXISTS jobs (
                     id TEXT PRIMARY KEY, worker TEXT NOT NULL, role TEXT NOT NULL,
-                    requested_model TEXT NOT NULL, reported_model TEXT,
+                    requested_model TEXT NOT NULL, worker_version TEXT,
+                    reported_model TEXT,
                     cwd TEXT NOT NULL, mode TEXT NOT NULL, task_summary TEXT NOT NULL,
                     status TEXT NOT NULL, created_at TEXT NOT NULL, started_at TEXT,
                     completed_at TEXT, duration_ms INTEGER, exit_code INTEGER,
@@ -81,6 +82,9 @@ class StateStore:
             row = db.execute('SELECT version FROM schema_info LIMIT 1').fetchone()
             if row is None:
                 db.execute('INSERT INTO schema_info(version) VALUES (?)', (SCHEMA_VERSION,))
+            elif row[0] == 1:
+                db.execute('ALTER TABLE jobs ADD COLUMN worker_version TEXT')
+                db.execute('UPDATE schema_info SET version=?', (SCHEMA_VERSION,))
             elif row[0] != SCHEMA_VERSION:
                 raise RuntimeError('Unsupported database schema version.')
         os.chmod(database, 0o600, follow_symlinks=False)
@@ -105,12 +109,12 @@ class StateStore:
             db.execute('INSERT INTO job_events(job_id,timestamp,event,detail) VALUES (?,?,?,?)',
                        (job_id, utc_now(), name, safe[:2000]))
 
-    def create_job(self, job_id, request, model, role, job_type='delegation'):
+    def create_job(self, job_id, request, model, role, worker_version=None, job_type='delegation'):
         with self.connect() as db:
-            db.execute('''INSERT INTO jobs(id,worker,role,requested_model,cwd,mode,task_summary,status,
+            db.execute('''INSERT INTO jobs(id,worker,role,requested_model,worker_version,cwd,mode,task_summary,status,
                 created_at,parent_job_id,delegation_group_id,job_type)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?)''',
-                (job_id, request.worker, role, model, str(request.cwd), request.mode,
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)''',
+                (job_id, request.worker, role, model, worker_version, str(request.cwd), request.mode,
                  summarize(request.task), 'queued', utc_now(), request.parent_job_id,
                  request.delegation_group_id, job_type))
             db.execute('INSERT INTO job_events(job_id,timestamp,event,detail) VALUES (?,?,?,?)',

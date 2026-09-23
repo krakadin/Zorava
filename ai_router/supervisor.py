@@ -26,7 +26,7 @@ POLL_SECONDS = 0.1
 _BUSY: set[str] = set()
 _BUSY_LOCK = threading.Lock()
 _ERROR_PATTERNS = (
-    ('AUTH_ERROR', re.compile(r'401|unauthori[sz]ed|invalid[_ -]?api[_ -]?key|authentication (?:failed|required|expired)|login required|token expired', re.I)),
+    ('AUTH_ERROR', re.compile(r'401|unauthori[sz]ed|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failed|required|expired)|login required|token expired', re.I)),
     ('RATE_LIMITED', re.compile(r'429|rate.?limit|too many requests', re.I)),
     ('QUOTA_OR_BILLING', re.compile(r'quota|billing|credits?.*(?:empty|exhausted|insufficient)', re.I)),
     ('MODEL_UNAVAILABLE', re.compile(r'model.*(?:not found|unavailable|unsupported)', re.I)),
@@ -40,6 +40,7 @@ class RunResult:
     job_id: str
     worker: str
     requested_model: str
+    worker_version: str
     status: str
     started_at: str | None
     completed_at: str
@@ -52,7 +53,8 @@ class RunResult:
 
     def json(self):
         return {'schema_version':1,'job_id':self.job_id,'worker':self.worker,
-                'requested_model':self.requested_model,'reported_model':self.reported_model,
+                'requested_model':self.requested_model,'worker_version':self.worker_version,
+                'reported_model':self.reported_model,
                 'status':self.status,'started_at':self.started_at,'completed_at':self.completed_at,
                 'duration_ms':self.duration_ms,'exit_code':self.exit_code,'result':self.result,
                 'error':self.error,'result_truncated':self.result_truncated}
@@ -140,8 +142,11 @@ class Supervisor:
         adapter = adapter_override or self.adapters.get(request.worker)
         if adapter is None or adapter.name != request.worker:
             raise ValueError('No matching worker adapter is configured.')
+        worker_version = adapter.version()
+        if not isinstance(worker_version, str) or not worker_version:
+            raise ValueError('Worker version could not be determined.')
         job_id = str(uuid.uuid4())
-        self.state.create_job(job_id,request,adapter.requested_model,adapter.role,job_type)
+        self.state.create_job(job_id,request,adapter.requested_model,adapter.role,worker_version,job_type)
         lock_path = self.runtime/'locks'/f'{request.worker}.lock'
         lock_fd = os.open(lock_path,os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
         lock_file = os.fdopen(lock_fd,'a+b')
@@ -155,7 +160,7 @@ class Supervisor:
                 fcntl.flock(lock_file.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
             except BlockingIOError:
                 self.state.fail_queued(job_id,'WORKER_BUSY','A job for this worker is already running.')
-                return self._failure(job_id,request,adapter,'failed','WORKER_BUSY','Worker is busy.',None,started_mono,None)
+                return self._failure(job_id,request,adapter,'failed','WORKER_BUSY','Worker is busy.',None,started_mono,None,worker_version)
             command = adapter.build_command(request,job_id)
             if not command or any(not isinstance(part,str) or '\x00' in part for part in command):
                 raise ValueError('Invalid worker command.')
@@ -206,7 +211,7 @@ class Supervisor:
                 elif status!='completed' and persisted.get('error_code'):
                     err={'code':persisted['error_code'],'message':persisted.get('error_message')}
             completed = self._now()
-            return RunResult(job_id,request.worker,adapter.requested_model,status,started_at,completed,
+            return RunResult(job_id,request.worker,adapter.requested_model,worker_version,status,started_at,completed,
                 duration,proc.returncode,final,parsed.reported_model if parsed else None,err,
                 bool(parsed and len(parsed.text)>MAX_TEXT))
         except Exception:
@@ -224,8 +229,15 @@ class Supervisor:
             except sqlite3.Error:
                 pass
             return self._failure(job_id,request,adapter,'failed','INTERNAL_ERROR',detail,
-                                 proc.returncode if proc else None,started_mono,started_at)
+                                 proc.returncode if proc else None,started_mono,started_at,worker_version)
         finally:
+            cleanup = getattr(adapter, 'cleanup', None)
+            if callable(cleanup):
+                try:
+                    cleanup(job_id)
+                except Exception:
+                    try: self.state.event(job_id, 'warning', 'Temporary worker input cleanup failed.')
+                    except sqlite3.Error: pass
             lock_file.close()
 
     def _communicate(self,proc,payload,timeout,job_id,stdout_data,stderr_data):
@@ -317,25 +329,26 @@ class Supervisor:
         if result['cancelled']: return 'cancelled','CANCELLED','Cancelled by user.'
         if result['timed_out']: return 'timed_out','TIMEOUT','Worker exceeded its time limit.'
         if result['oversized']: return 'failed','OUTPUT_LIMIT','Worker output exceeded the configured limit.'
-        if parse_error: return 'invalid_output',parse_error,'Worker returned an unexpected output format.'
         if exit_code != 0:
             for code,pattern in _ERROR_PATTERNS:
                 if pattern.search(diagnostic):
                     status='auth_error' if code=='AUTH_ERROR' else 'rate_limited' if code=='RATE_LIMITED' else 'failed'
                     return status,code,'Worker reported a provider or execution error.'
+            if parse_error: return 'invalid_output',parse_error,'Worker returned an unexpected output format.'
             return 'failed','WORKER_CRASH','Worker exited unsuccessfully.'
+        if parse_error: return 'invalid_output',parse_error,'Worker returned an unexpected output format.'
         if parsed is None:
             return 'invalid_output','INVALID_OUTPUT','Worker did not produce a valid structured result.'
         return 'completed',None,None
 
-    def _failure(self,job_id,request,adapter,status,code,message,exit_code,started_mono,started_at):
+    def _failure(self,job_id,request,adapter,status,code,message,exit_code,started_mono,started_at,worker_version='unknown'):
         try:
             current=self.state.get_job(job_id)
             if current and current['status']=='queued':
                 self.state.fail_queued(job_id,code,message)
         except sqlite3.Error:
             pass
-        return RunResult(job_id,request.worker,adapter.requested_model,status,started_at,self._now(),
+        return RunResult(job_id,request.worker,adapter.requested_model,worker_version,status,started_at,self._now(),
             int((time.monotonic()-started_mono)*1000),exit_code,None,None,{'code':code,'message':message})
 
     @staticmethod

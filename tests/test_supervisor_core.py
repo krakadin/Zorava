@@ -148,8 +148,10 @@ class StateAndProcessTests(SupervisorFixture):
         result=self.run_mode()
         self.assertEqual(result.status,'completed')
         self.assertEqual(result.reported_model,'fake-v1')
+        self.assertEqual(result.worker_version,'fake-1')
         job=self.supervisor.state.get_job(result.job_id)
         self.assertEqual(job['status'],'completed')
+        self.assertEqual(job['worker_version'],'fake-1')
         self.assertEqual(job['usage_json'],'{"input_tokens":3,"output_tokens":4}')
         self.assertEqual([e['event'] for e in job['events']],['queued','started','completed'])
 
