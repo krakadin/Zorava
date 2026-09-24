@@ -144,6 +144,18 @@ class RequestAndRedactionTests(SupervisorFixture):
 
 
 class StateAndProcessTests(SupervisorFixture):
+    def test_kimi_five_hour_and_weekly_limits_classify_as_quota(self):
+        for diagnostic in (
+            "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends.",
+            "You've reached your weekly (7-day) usage limit.",
+            "You've reached your monthly usage limit for this billing cycle.",
+        ):
+            with self.subTest(diagnostic=diagnostic):
+                outcome = Supervisor._classify(
+                    {'cancelled':False,'timed_out':False,'oversized':False},
+                    1, diagnostic, None, 'INVALID_OUTPUT')
+                self.assertEqual(outcome[:2], ('failed','QUOTA_OR_BILLING'))
+
     def test_success_result_and_job_event_trail(self):
         result=self.run_mode()
         self.assertEqual(result.status,'completed')

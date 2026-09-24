@@ -28,7 +28,11 @@ _BUSY_LOCK = threading.Lock()
 _ERROR_PATTERNS = (
     ('AUTH_ERROR', re.compile(r'401|unauthori[sz]ed|invalid[_ -]?api[_ -]?key|auth(?:entication)?[_ -]?(?:failed|required|expired)|login required|token expired', re.I)),
     ('RATE_LIMITED', re.compile(r'429|rate.?limit|too many requests', re.I)),
-    ('QUOTA_OR_BILLING', re.compile(r'quota|billing|credits?.*(?:empty|exhausted|insufficient)', re.I)),
+    ('QUOTA_OR_BILLING', re.compile(
+        r'quota|billing|credits?.*(?:empty|exhausted|insufficient)|'
+        r'(?:5[- ]hour|weekly|monthly).{0,50}(?:usage )?limit|'
+        r'(?:usage )?limit.{0,50}(?:5[- ]hour|weekly|monthly)|'
+        r'insufficient account balance', re.I)),
     ('MODEL_UNAVAILABLE', re.compile(r'model.*(?:not found|unavailable|unsupported)', re.I)),
     ('CONTEXT_TOO_LARGE', re.compile(r'context.*(?:too large|exceed|max(?:imum)? length)', re.I)),
     ('NETWORK_ERROR', re.compile(r'ECONNRESET|ENOTFOUND|ETIMEDOUT|connection refused|network error', re.I)),
