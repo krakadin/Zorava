@@ -152,7 +152,7 @@
   }
   async function jobDetail() {
     title('Job detail','Sanitized local record · worker output is advisory.');
-    root.prepend(node('a','← Back to jobs','crumb')).href='/?page=jobs';
+    const back=node('a','← Back to jobs','crumb');back.href='/?page=jobs';root.prepend(back);
     const data=await get('/api/v1/jobs/'+encodeURIComponent(jobId));const job=data.job;
     const summary=panel('SUMMARY'); const dl=node('dl',undefined,'kv');
     [['Job ID',job.id],['Parent/orchestrator','Claude'],['Worker',job.role+' ('+job.worker+')'],['Requested model',job.requested_model],['Reported model',job.reported_model||'Not provided'],['CLI version',job.worker_version],['Project',job.cwd],['Mode',job.mode],['Status',job.status],['Created',displayTime(job.created_at)],['Started',displayTime(job.started_at)],['Completed',displayTime(job.completed_at)],['Duration',duration(job.duration_ms)],['Exit code',job.exit_code],['Usage',job.usage?JSON.stringify(job.usage):'Not reported by worker']].forEach(([a,b])=>addKV(dl,a,b,true));
