@@ -30,6 +30,7 @@ class WorkerRequest:
     timeout_seconds: int
     parent_job_id: str | None = None
     delegation_group_id: str | None = None
+    max_tool_calls: int | None = None
 
 
 def _safe_id(value, name):
@@ -67,6 +68,12 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
     timeout = payload.get('timeout_seconds', DEFAULT_TIMEOUT[worker])
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
         raise RequestError('INVALID_TIMEOUT', 'Timeout must be between 10 and 1800 seconds.')
+    max_tool_calls = payload.get('max_tool_calls', 24 if worker == 'qwen' else None)
+    if worker == 'qwen' and (isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int)
+                             or not 0 <= max_tool_calls <= 24):
+        raise RequestError('INVALID_REQUEST', 'Qwen max_tool_calls must be between 0 and 24.')
+    if worker == 'kimi' and max_tool_calls is not None:
+        raise RequestError('INVALID_REQUEST', 'max_tool_calls is not supported by Kimi.')
     cwd = payload.get('cwd')
     if not isinstance(cwd, str) or '\x00' in cwd:
         raise RequestError('PATH_NOT_ALLOWED', 'Working directory is invalid.')
@@ -90,4 +97,4 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
         raise RequestError('INVALID_REQUEST', 'Parent job ID must be a UUID.')
     if payload.get('delegation_group_id') is not None and group is None:
         raise RequestError('INVALID_REQUEST', 'Delegation group ID must be a UUID.')
-    return WorkerRequest(worker, task, context, resolved, mode, timeout, parent, group)
+    return WorkerRequest(worker, task, context, resolved, mode, timeout, parent, group, max_tool_calls)

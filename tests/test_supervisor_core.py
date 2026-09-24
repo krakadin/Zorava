@@ -82,7 +82,17 @@ class RequestAndRedactionTests(SupervisorFixture):
         req=parse_request(json.dumps({'worker':'qwen','task':'trace café','cwd':str(self.project)}).encode(),(self.root,))
         self.assertEqual(req.timeout_seconds,300)
         self.assertEqual(req.mode,'read-only')
+        self.assertEqual(req.max_tool_calls,24)
         self.assertIn('café',req.task)
+
+    def test_qwen_tool_limit_is_bounded_and_zero_disables_tools(self):
+        req=parse_request(self.request(max_tool_calls=0),(self.root,))
+        self.assertEqual(req.max_tool_calls,0)
+        for value in (True,-1,25,'0'):
+            with self.subTest(value=value), self.assertRaises(RequestError):
+                parse_request(self.request(max_tool_calls=value),(self.root,))
+        with self.assertRaises(RequestError):
+            parse_request(self.request(worker='kimi',max_tool_calls=0),(self.root,))
 
     def test_invalid_worker_and_mode_are_rejected(self):
         for changes,code in [({'worker':'other'},'INVALID_WORKER'),({'mode':'edit'},'INVALID_MODE')]:

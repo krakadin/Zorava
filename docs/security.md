@@ -4,15 +4,16 @@
 
 - Claude owns Claude Max OAuth; ai-router does not read `~/.claude/.credentials.json` and does not change Claude routing.
 - Kimi owns Kimi Code OAuth under its own configuration. ai-router does not copy or parse OAuth credentials.
-- Kimi subprocesses receive only an explicit environment built by the adapter. Anthropic, Qwen, and generic provider credential variables are not inherited. `HOME` is retained so Kimi can read its own configuration.
+- Qwen owns its Token Plan key in its existing Qwen Code settings. ai-router parses only safe model/endpoint/credential-presence metadata, does not copy the key, and does not pass `DASHSCOPE_API_KEY` to the child environment.
+- Worker subprocesses receive only an explicit environment built by their adapters. Anthropic, Qwen, Kimi, and generic provider credential variables are not inherited across provider boundaries. `HOME` is retained so each CLI can read its own configuration.
 - ai-router has no provider credentials, credential form, vault, telemetry, or direct provider HTTP client.
-- Qwen is not currently enabled. The Alibaba Token Plan usage restrictions are documented in `SECURITY_CHECKPOINT.md`.
+- Qwen calls are synchronous, bounded, and initiated only for a user-directed task in an active Claude session. There is no scheduled, unattended, bulk, daemon, or standalone service path. The interpretation of Alibaba's usage scope and its uncertainty are documented in `SECURITY_CHECKPOINT.md`.
 
 ## Read-only behavior and limits
 
-The Kimi profile allowlists the installed CLI's exact read tools: `Read`, `Grep`, and `Glob`; `subagents: []` disables nested agents. There is no shell tool in the profile. The parent instruction treats repository content as untrusted and forbids credential discovery, writes, installation, commits, pushes, deployment, and spawning other AI tools.
+The Kimi profile allowlists the installed CLI's exact read tools: `Read`, `Grep`, and `Glob`; `subagents: []` disables nested agents. There is no shell tool in the profile. Qwen runs in its installed CLI's `plan` approval mode, with a core allowlist of `read_file`, `list_directory`, `glob`, and `grep_search`, explicit exclusions for mutation/shell/agent/network and related tools, bounded tool calls/time, and chat recording disabled. Both worker instructions treat repository content as untrusted and forbid credential discovery, writes, installation, commits, pushes, deployment, and recursive AI workers.
 
-These are application-level tool restrictions and prompt policy, not a kernel sandbox. The subprocess runs as the same Unix user, and Kimi CLI can access the user's Kimi-owned configuration because it needs its own authentication. Do not delegate a repository or context that must not be sent to Kimi. Provider-side retention is controlled by Kimi's service/account terms, not ai-router.
+These are application-level tool restrictions and prompt policy, not a kernel read sandbox. The subprocess runs as the same Unix user, and provider CLIs can access their own user-owned configuration because they need their authentication. Do not delegate a repository or context that must not be sent to the selected external provider. Provider-side retention is controlled by the selected provider's service/account terms, not ai-router.
 
 ## Opt-in isolated-edit mode
 
@@ -34,4 +35,4 @@ Job summaries, normalized results, and errors may contain proprietary source con
 
 The design helps reduce accidental credential leakage, cross-provider credential inheritance, command injection, path traversal, malformed/oversized output, runaway processes, and worker write actions through the configured tool allowlist. It does not defend against malicious code already running as the same Unix user, root/kernel compromise, a malicious CLI binary/provider, every same-user filesystem attack, or provider-side data retention.
 
-Claude's own session history may contain the tool invocation and returned worker result as part of normal Claude Code behavior. Do not use delegation for confidential material unless sending it to Kimi is acceptable.
+Claude's own session history may contain the tool invocation and returned worker result as part of normal Claude Code behavior. Do not use delegation for confidential material unless sending it to the selected worker's provider is acceptable.

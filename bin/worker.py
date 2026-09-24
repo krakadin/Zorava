@@ -16,11 +16,12 @@ import uuid
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
-from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, RequestError
+from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT, RequestError
 from ai_router.landlock import LandlockUnavailable, landlock_abi
 from ai_router.state import StateStore
 from ai_router.supervisor import Supervisor
 from workers.kimi import KimiAdapter
+from workers.qwen import QwenAdapter
 
 
 RUNTIME = Path('/home/krakadin/.local/state/ai-workers')
@@ -38,10 +39,11 @@ EXIT_CODES = {
 }
 
 
-def build_supervisor() -> tuple[Supervisor, KimiAdapter]:
+def build_supervisor() -> tuple[Supervisor, dict]:
     runtime_tmp = RUNTIME / 'tmp'
-    adapter = KimiAdapter(runtime_tmp=runtime_tmp)
-    return Supervisor(RUNTIME, ALLOWED_ROOTS, {'kimi': adapter}), adapter
+    adapters = {'kimi': KimiAdapter(runtime_tmp=runtime_tmp),
+                'qwen': QwenAdapter(runtime_tmp=runtime_tmp)}
+    return Supervisor(RUNTIME, ALLOWED_ROOTS, adapters), adapters
 
 
 def emit_json(value: dict, exit_code: int = 0) -> int:
@@ -82,7 +84,7 @@ def command_delegate(args) -> int:
         if not task.strip():
             raise RequestError('INVALID_TASK', 'Task input is empty.')
         request = {'worker': args.worker, 'task': task, 'cwd': args.cwd,
-                   'mode': args.mode, 'timeout_seconds': args.timeout}
+                   'mode': args.mode, 'timeout_seconds': args.timeout or DEFAULT_TIMEOUT[args.worker]}
         value, code = run_request(json.dumps(request, ensure_ascii=False).encode('utf-8'))
     except (UnicodeDecodeError, RequestError) as exc:
         code_name = exc.code if isinstance(exc, RequestError) else 'INVALID_TASK'
@@ -103,6 +105,8 @@ def command_test(args) -> int:
     task = f'Reply with exactly {args.worker.upper()}_WORKER_OK. Do not inspect files or call tools.'
     request = {'worker': args.worker, 'task': task, 'cwd': str(PROJECT),
                'mode': 'read-only', 'timeout_seconds': 120}
+    if args.worker == 'qwen':
+        request['max_tool_calls'] = 0
     value, code = run_request(json.dumps(request).encode('utf-8'), job_type='provider_test')
     expected = f'{args.worker.upper()}_WORKER_OK'
     if value.get('status') == 'completed':
@@ -118,13 +122,11 @@ def command_test(args) -> int:
 
 def print_human(value: dict, exit_code: int = 0) -> int:
     if value.get('job_id'):
-        print(f"Kimi job {value.get('status', 'unknown')} ({value['job_id']})")
-        print(f"Model requested: {value.get('requested_model', KimiAdapter.requested_model)}")
+        print(f"{str(value.get('worker', 'Worker')).title()} job {value.get('status', 'unknown')} ({value['job_id']})")
+        print(f"Model requested: {value.get('requested_model', 'unknown')}")
         print(f"CLI version: {value.get('worker_version', 'unknown')}")
         if value.get('duration_ms') is not None:
             print(f"Duration: {value['duration_ms']} ms")
-        if value.get('result'):
-            print(value['result'])
         if value.get('workspace'):
             print(f"Isolated worktree: {value['workspace'].get('path','unknown')}")
             print(f"Changed files: {value['workspace'].get('change_count',0)}")
@@ -143,21 +145,23 @@ def print_human(value: dict, exit_code: int = 0) -> int:
 
 def command_preflight(args) -> int:
     try:
-        adapter = KimiAdapter(RUNTIME / 'tmp')
+        adapter = {'kimi': KimiAdapter, 'qwen': QwenAdapter}[args.worker](RUNTIME / 'tmp')
         version = adapter.version()
         info = adapter.configuration_info()
-        try:
-            abi = landlock_abi()
-            edit_sandbox = {'status':'AVAILABLE','mechanism':'Landlock','abi':abi}
-        except LandlockUnavailable as exc:
-            edit_sandbox = {'status':'UNAVAILABLE','reason':str(exc)}
-        value = {'schema_version': 1, 'worker': 'kimi', 'status': 'CONFIGURED',
+        value = {'schema_version': 1, 'worker': args.worker, 'status': 'CONFIGURED',
                  'executable': str(adapter.executable), 'version': version,
                  'requested_model': info['cli_model'], 'provider': info['provider'],
                  'endpoint_host': info['endpoint_host'],
-                 'authentication': 'Kimi Code managed OAuth; credential not inspected',
-                 'isolated_edit_sandbox': edit_sandbox,
+                 'authentication': ('Kimi Code managed OAuth; credential not inspected' if args.worker == 'kimi'
+                                    else ('Qwen-owned credential present' if info['credential_present'] else 'Qwen credential missing')),
                  'provider_test': 'not performed by preflight'}
+        if args.worker == 'kimi':
+            try:
+                abi = landlock_abi()
+                edit_sandbox = {'status':'AVAILABLE','mechanism':'Landlock','abi':abi}
+            except LandlockUnavailable as exc:
+                edit_sandbox = {'status':'UNAVAILABLE','reason':str(exc)}
+            value['isolated_edit_sandbox'] = edit_sandbox
         return emit_json(value) if args.json else print_human(value)
     except (OSError, RuntimeError, ValueError) as exc:
         value = error_result('CONFIG_ERROR', str(exc)[:240])
@@ -184,16 +188,22 @@ def command_status(args) -> int:
         rows = StateStore(RUNTIME / 'workers.db').jobs(limit=100)
     except (OSError, RuntimeError, sqlite3.Error):
         rows = []
-    last_test = next((row for row in rows if row.get('worker') == 'kimi'
-                      and row.get('job_type') == 'provider_test'), None)
-    kimi_status = 'UNKNOWN'
-    if last_test:
-        if last_test.get('status') == 'completed':
-            kimi_status = 'LAST_TEST_SUCCEEDED'
-        elif last_test.get('error_code') == 'AUTH_ERROR':
-            kimi_status = 'AUTH_REQUIRED'
-        else:
-            kimi_status = 'LAST_TEST_FAILED'
+    last_tests = {name: next((row for row in rows if row.get('worker') == name
+                              and row.get('job_type') == 'provider_test'), None)
+                  for name in ('qwen', 'kimi')}
+    provider_status = {}
+    for name, last_test in last_tests.items():
+        status = 'UNKNOWN'
+        if last_test:
+            if last_test.get('status') == 'completed': status = 'LAST_TEST_SUCCEEDED'
+            elif last_test.get('error_code') == 'AUTH_ERROR': status = 'AUTH_REQUIRED'
+            else: status = 'LAST_TEST_FAILED'
+        provider_status[name] = status
+    try:
+        qwen_info = QwenAdapter(RUNTIME/'tmp').configuration_info()
+    except (OSError, RuntimeError, ValueError):
+        qwen_info = {'provider': 'Alibaba Model Studio Token Plan', 'endpoint_host': 'unknown',
+                     'cli_model': QwenAdapter.requested_model, 'credential_present': False}
     value = {
         'schema_version': 1,
         'claude': {
@@ -203,14 +213,24 @@ def command_status(args) -> int:
             'authentication': 'Claude Code-managed Max OAuth; not tested by ai-worker',
             'routing': 'OVERRIDE_PRESENT' if settings_base_override or env_override else 'DIRECT (no ANTHROPIC_BASE_URL override detected)',
         },
+        'qwen': {
+            'status': provider_status['qwen'],
+            'executable': str(QwenAdapter(RUNTIME/'tmp').executable),
+            'requested_model': qwen_info['cli_model'],
+            'provider': qwen_info['provider'],
+            'endpoint_host': qwen_info['endpoint_host'],
+            'authentication': 'Qwen-owned credential present' if qwen_info['credential_present'] else 'Qwen credential missing',
+            'last_test_at': last_tests['qwen'].get('completed_at') if last_tests['qwen'] else None,
+            'last_test_status': last_tests['qwen'].get('status') if last_tests['qwen'] else None,
+        },
         'kimi': {
-            'status': kimi_status,
+            'status': provider_status['kimi'],
             'executable': '/home/krakadin/.kimi-code/bin/kimi',
             'requested_model': 'kimi-code/k3',
             'provider': 'Kimi Code',
             'authentication': 'Kimi Code-managed OAuth; credential not inspected',
-            'last_test_at': last_test.get('completed_at') if last_test else None,
-            'last_test_status': last_test.get('status') if last_test else None,
+            'last_test_at': last_tests['kimi'].get('completed_at') if last_tests['kimi'] else None,
+            'last_test_status': last_tests['kimi'].get('status') if last_tests['kimi'] else None,
         },
         'dashboard': 'not implemented',
         'runtime': str(RUNTIME),
@@ -218,7 +238,7 @@ def command_status(args) -> int:
     if args.json:
         return emit_json(value)
     print('AI Worker Status')
-    for provider in ('claude', 'kimi'):
+    for provider in ('claude', 'qwen', 'kimi'):
         info = value[provider]
         print(f"\n{provider.title()}\n  Status: {info['status']}\n  Model: {info.get('model') or info.get('requested_model') or 'unknown'}")
         print(f"  Provider: {info['provider']}\n  Authentication: {info['authentication']}")
@@ -356,17 +376,18 @@ def make_parser() -> argparse.ArgumentParser:
     run.add_argument('--json', action='store_true', help='Emit machine-readable JSON only.')
     run.set_defaults(func=command_run)
     delegate = commands.add_parser('delegate', help='Read task text from stdin and delegate to one worker.')
-    delegate.add_argument('worker', choices=('kimi',))
+    delegate.add_argument('worker', choices=('qwen','kimi'))
     delegate.add_argument('--cwd', required=True)
-    delegate.add_argument('--timeout', type=int, default=600)
+    delegate.add_argument('--timeout', type=int)
     delegate.add_argument('--mode', choices=('read-only','isolated-edit'), default='read-only')
     delegate.add_argument('--json', action='store_true')
     delegate.set_defaults(func=command_delegate)
     test = commands.add_parser('test', help='Run a small live provider smoke test.')
-    test.add_argument('worker', choices=('kimi',))
+    test.add_argument('worker', choices=('qwen','kimi'))
     test.add_argument('--json', action='store_true')
     test.set_defaults(func=command_test)
-    preflight = commands.add_parser('preflight', help='Check Kimi executable/configuration locally; no provider call.')
+    preflight = commands.add_parser('preflight', help='Check worker executable/configuration locally; no provider call.')
+    preflight.add_argument('worker', choices=('qwen','kimi'), nargs='?', default='kimi')
     preflight.add_argument('--json', action='store_true')
     preflight.set_defaults(func=command_preflight)
     status = commands.add_parser('status', help='Show local Claude routing and cached Kimi test status.')
