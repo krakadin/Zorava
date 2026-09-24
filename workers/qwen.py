@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import stat
 import subprocess
 
@@ -60,6 +61,27 @@ class QwenAdapter(IsolatedWorkspace):
         # particular, do not inherit DASHSCOPE_API_KEY or any other provider
         # secret from the Claude parent environment.
         return common_child_environment()
+
+    def prepare_request(self, request: WorkerRequest, job_id: str) -> WorkerRequest:
+        if request.mode != 'read-only':
+            return super().prepare_request(request, job_id)
+        # Two read-only Qwen sessions may run at the same time, so each job
+        # gets its own private TMPDIR and Qwen runtime directory instead of
+        # sharing mutable state. The request itself is unchanged: read-only
+        # jobs keep the caller's directory and produce no worktree or diff.
+        # cleanup() removes the directory again when the job finishes.
+        job_dir = self._private_job_dir(job_id)
+        try:
+            env = self.build_environment()
+            env['TMPDIR'] = str(self._private_subdirectory(job_dir, 'tmp'))
+            env['QWEN_RUNTIME_DIR'] = str(self._private_subdirectory(job_dir, 'qwen-runtime'))
+            with self._dirs_lock:
+                self._job_dirs[job_id] = job_dir
+                self._job_env[job_id] = env
+        except BaseException:
+            shutil.rmtree(job_dir, ignore_errors=True)
+            raise
+        return request
 
     def _prepare_editor(self, job_dir: Path, worktree: Path) -> dict[str, str]:
         self.configuration_info()

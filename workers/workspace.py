@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 
 from ai_router.request import WorkerRequest
@@ -94,6 +95,34 @@ class IsolatedWorkspace:
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
+
+    def _private_job_dir(self, job_id: str) -> Path:
+        """Create one user-private directory under ``runtime/tmp`` for a job.
+
+        Read-only jobs use it for their own mutable runtime state so that two
+        concurrent sessions never share a directory. ``cleanup`` removes it
+        again. An unsafe parent directory fails closed before anything is
+        created.
+        """
+        path = self.runtime_tmp
+        try:
+            info = path.lstat()
+        except OSError:
+            raise WorkerSetupError('CONFIG_ERROR', 'Worker temporary directory is unavailable or unsafe.') from None
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Worker temporary directory must be user-owned with mode 0700.')
+        job_dir = Path(tempfile.mkdtemp(prefix=f'{job_id}-', dir=path))
+        os.chmod(job_dir, 0o700)
+        return job_dir
+
+    @staticmethod
+    def _private_subdirectory(job_dir: Path, name: str) -> Path:
+        target = job_dir / name
+        target.mkdir(mode=0o700)
+        os.chmod(target, 0o700)
+        return target
 
     def _git(self, args: list[str], cwd: Path, timeout: int = 10):
         env = self.build_environment()
@@ -185,8 +214,15 @@ class IsolatedWorkspace:
         if worktree is not None:
             # Retain edits and per-job runtime data for parent/user review.
             return
-        if (job_dir.parent != self.runtime_tmp or job_dir.is_symlink()
-                or job_dir.stat().st_uid != os.getuid()):
+        if job_dir.parent != self.runtime_tmp or job_dir.is_symlink():
+            raise RuntimeError('Refusing to remove an unsafe worker task directory.')
+        try:
+            info = job_dir.lstat()
+        except FileNotFoundError:
+            return  # Already gone; per-job state cannot be shared or leaked.
+        except OSError:
+            raise RuntimeError('Refusing to remove an unsafe worker task directory.') from None
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
             raise RuntimeError('Refusing to remove an unsafe worker task directory.')
         shutil.rmtree(job_dir)
 

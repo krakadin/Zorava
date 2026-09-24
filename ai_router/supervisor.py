@@ -9,6 +9,7 @@ import re
 import selectors
 import signal
 import sqlite3
+import stat
 import subprocess
 import threading
 import time
@@ -317,6 +318,33 @@ class Supervisor:
             if lock_file is not None:
                 lock_file.close()
 
+    @staticmethod
+    def _open_slot_lock(path: Path) -> int:
+        """Open one slot lock file and verify that it is private to this user.
+
+        The descriptor is returned unlocked. A symlink, a non-regular file, a
+        hard link, foreign ownership, or any group/other permission bit fails
+        closed with CONFIG_ERROR; an unsafe lock file is never used and never
+        silently repaired.
+        """
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+        except OSError:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   f'Worker slot lock {path.name} could not be opened safely.') from None
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                    or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) & 0o077):
+                raise WorkerSetupError('CONFIG_ERROR',
+                                       f'Worker slot lock {path.name} must be a user-owned regular file '
+                                       'with 0600 permissions and no hard links.')
+        except BaseException:
+            try: os.close(fd)
+            except OSError: pass
+            raise
+        return fd
+
     def _wait_for_slot(self, worker: str, capacity: int, job_id: str):
         """Acquire one of the worker's cross-process slot locks.
 
@@ -324,21 +352,27 @@ class Supervisor:
         Jobs beyond capacity stay queued here and start when a slot frees
         instead of failing WORKER_BUSY. Returns the open locked file, or None
         when the job was cancelled while queued (recorded by cancel_queued).
+        Every descriptor that is not handed back is closed exactly once.
         """
         locks_dir = self.runtime/'locks'
         fds = []
         try:
             for index in range(max(1, capacity)):
-                fds.append(os.open(locks_dir/f'{worker}.{index}.lock',
-                                   os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600))
+                fds.append(self._open_slot_lock(locks_dir/f'{worker}.{index}.lock'))
             while True:
-                for fd in fds:
+                for fd in tuple(fds):
                     try:
                         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
                     except BlockingIOError:
                         continue
+                    if self.state.is_cancel_requested(job_id):
+                        # Cancelled while queued: hand the slot straight back
+                        # so no worker process is ever started for this job.
+                        return None
+                    stream = os.fdopen(fd,'a+b')
+                    # Only forget the descriptor once the file object owns it.
                     fds.remove(fd)
-                    return os.fdopen(fd,'a+b')
+                    return stream
                 if self.state.is_cancel_requested(job_id):
                     return None
                 time.sleep(POLL_SECONDS)

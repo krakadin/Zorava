@@ -190,11 +190,19 @@ class DashboardController:
                 try:
                     fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
                 except FileNotFoundError:
+                    # A slot lock that no supervisor ever created cannot be
+                    # held, so it must not keep an exited job's row from being
+                    # recovered. A live process group is still checked below.
+                    continue
+                except OSError:
                     return True
                 try:
                     fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    os.close(fd)
+                except OSError:
+                    # BlockingIOError means a supervisor holds this slot; any
+                    # other error means the slot cannot be verified as free.
+                    try: os.close(fd)
+                    except OSError: pass
                     return True
                 held.append(fd)
             for job in self.store.active_jobs(worker):
@@ -206,7 +214,8 @@ class DashboardController:
                 self.store.mark_interrupted(job['id'])
         finally:
             for fd in held:
-                os.close(fd)
+                try: os.close(fd)
+                except OSError: pass
         return False
 
     def start_test(self, worker: str) -> str:

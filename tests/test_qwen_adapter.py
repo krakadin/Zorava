@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import unittest
+import stat
 import subprocess
 import tempfile
 from dataclasses import replace
@@ -93,6 +94,58 @@ class QwenAdapterTests(unittest.TestCase):
             with self.assertRaises(WorkerSetupError) as caught:
                 adapter.configuration_info()
             self.assertNotIn('synthetic-value', str(caught.exception))
+
+    def test_read_only_jobs_get_private_runtime_and_tmp_state(self):
+        # Two concurrent read-only sessions must not share mutable Qwen state.
+        with tempfile.TemporaryDirectory(prefix='qwen-readonly-test-') as tmp:
+            runtime_tmp = Path(tmp)/'runtime'/'tmp'
+            runtime_tmp.mkdir(parents=True, mode=0o700)
+            os.chmod(runtime_tmp, 0o700)
+            adapter = QwenAdapter(runtime_tmp)
+            first = 'ad147ed0-a95a-40d6-8e72-bff65fdb18be'
+            second = 'b7c10e09-04ef-41ad-b903-96f975b761ad'
+            # Read-only keeps the caller's directory: no worktree, no diff.
+            self.assertEqual(adapter.prepare_request(self.request, first), self.request)
+            self.assertEqual(adapter.prepare_request(self.request, second), self.request)
+            envs = [adapter.build_environment(job) for job in (first, second)]
+            self.assertNotEqual(envs[0]['TMPDIR'], envs[1]['TMPDIR'])
+            self.assertNotEqual(envs[0]['QWEN_RUNTIME_DIR'], envs[1]['QWEN_RUNTIME_DIR'])
+            for env in envs:
+                self.assertNotIn('DASHSCOPE_API_KEY', env)
+                for name in ('TMPDIR', 'QWEN_RUNTIME_DIR'):
+                    path = Path(env[name])
+                    self.assertTrue(path.is_dir())
+                    self.assertFalse(path.is_symlink())
+                    self.assertTrue(path.is_relative_to(runtime_tmp))
+                    self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o700)
+                    self.assertEqual(path.stat().st_uid, os.getuid())
+            self.assertEqual(len(list(runtime_tmp.iterdir())), 2)
+            adapter.cleanup(first)
+            self.assertFalse(Path(envs[0]['TMPDIR']).exists())
+            self.assertFalse(Path(envs[0]['QWEN_RUNTIME_DIR']).exists())
+            # Cleaning one job leaves the other job's private state intact.
+            self.assertTrue(Path(envs[1]['TMPDIR']).is_dir())
+            self.assertTrue(Path(envs[1]['QWEN_RUNTIME_DIR']).is_dir())
+            self.assertEqual(adapter.build_environment(second), envs[1])
+            # A finished job keeps no per-job environment of its own.
+            self.assertEqual(adapter.build_environment(first), adapter.build_environment())
+            adapter.cleanup(second)
+            self.assertEqual(list(runtime_tmp.iterdir()), [])
+
+    def test_read_only_runtime_preparation_fails_closed_on_an_unsafe_tmp_directory(self):
+        with tempfile.TemporaryDirectory(prefix='qwen-readonly-unsafe-') as tmp:
+            runtime_tmp = Path(tmp)/'tmp'
+            runtime_tmp.mkdir(mode=0o755)
+            os.chmod(runtime_tmp, 0o755)
+            adapter = QwenAdapter(runtime_tmp)
+            job_id = 'ad147ed0-a95a-40d6-8e72-bff65fdb18be'
+            with self.assertRaises(WorkerSetupError) as caught:
+                adapter.prepare_request(self.request, job_id)
+            self.assertEqual(caught.exception.code, 'CONFIG_ERROR')
+            self.assertEqual(list(runtime_tmp.iterdir()), [])
+            self.assertEqual(adapter._job_dirs, {})
+            self.assertEqual(adapter._job_env, {})
+            adapter.cleanup(job_id)  # nothing recorded, nothing removed
 
     def test_qwen_coder_edits_are_isolated_and_return_a_reviewable_diff(self):
         with tempfile.TemporaryDirectory(prefix='qwen-worktree-test-') as tmp:

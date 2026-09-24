@@ -5,16 +5,18 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import sys
 import tempfile
 import time
 import unittest
 import uuid
 
+from ai_router.request import parse_request
 from ai_router.settings import (DEFAULT_KIMI_CONCURRENCY, DEFAULT_QWEN_CONCURRENCY,
                                 load_worker_concurrency, save_settings)
 from ai_router.supervisor import Supervisor
-from workers.base import ParsedOutput, common_child_environment
+from workers.base import ParsedOutput, WorkerSetupError, common_child_environment
 from workers.workspace import IsolatedWorkspace
 
 
@@ -88,6 +90,23 @@ class ConcurrencyFixture(unittest.TestCase):
                 return True
             time.sleep(0.02)
         return False
+
+    def serialized(self, ids):
+        """True once every job row exists and exactly one job holds the slot.
+
+        Comparing statuses before both rows exist races with job creation, so
+        single-capacity assertions wait for this predicate instead.
+        """
+        rows = [self.job(job_id) for job_id in ids]
+        if any(row is None for row in rows):
+            return False
+        return {row['status'] for row in rows} == {'running', 'queued'}
+
+    @staticmethod
+    def open_fd_count():
+        """Descriptor count for this process; scandir's own fd is a constant."""
+        with os.scandir('/proc/self/fd') as entries:
+            return len(list(entries))
 
     def run_jobs(self, entries):
         """Run (worker, job_id, mode) tuples concurrently; returns futures map."""
@@ -176,8 +195,10 @@ class SlotConcurrencyTests(ConcurrencyFixture):
     def test_kimi_default_single_slot_serializes_jobs(self):
         ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         futures = self.run_jobs([('kimi', ids[0], 'gate'), ('kimi', ids[1], 'gate')])
-        self.assertTrue(self.wait_for(lambda: (self.job(ids[0]) or {}).get('status') == 'running'
-                                              or (self.job(ids[1]) or {}).get('status') == 'running'))
+        # Both rows must exist before their statuses are compared; reading the
+        # second job before its row was created raced with job creation.
+        self.assertTrue(self.wait_for(lambda: self.serialized(ids)),
+                        'a single Kimi slot did not keep one job running and one queued')
         statuses = {self.job(i)['status'] for i in ids}
         self.assertEqual(statuses, {'running', 'queued'})
         self.open_gate()
@@ -202,8 +223,8 @@ class SlotConcurrencyTests(ConcurrencyFixture):
         qwen_ids = [str(uuid.uuid4()), str(uuid.uuid4())]
         futures = self.run_jobs([('qwen', qwen_ids[0], 'gate'), ('qwen', qwen_ids[1], 'gate')])
         self.gate.unlink()
-        self.assertTrue(self.wait_for(lambda: (self.job(qwen_ids[0]) or {}).get('status') == 'running'
-                                              or (self.job(qwen_ids[1]) or {}).get('status') == 'running'))
+        self.assertTrue(self.wait_for(lambda: self.serialized(qwen_ids)),
+                        'saved qwen_concurrency=1 did not serialize Qwen jobs')
         statuses = {self.job(i)['status'] for i in qwen_ids}
         self.assertEqual(statuses, {'running', 'queued'},
                          'saved qwen_concurrency=1 did not serialize Qwen jobs')
@@ -226,6 +247,102 @@ class SlotConcurrencyTests(ConcurrencyFixture):
             self.assertNotIn(ids[1 - index], result.result)
 
 
+class SlotAcquisitionTests(ConcurrencyFixture):
+    """Slot acquisition is descriptor-clean and honours queued cancellation."""
+
+    def test_slot_acquisition_returns_exactly_one_descriptor(self):
+        before = self.open_fd_count()
+        lock = self.supervisor._wait_for_slot('qwen', DEFAULT_QWEN_CONCURRENCY, str(uuid.uuid4()))
+        try:
+            self.assertIsNotNone(lock)
+            # Both candidate slots are opened; only the acquired one survives.
+            self.assertEqual(self.open_fd_count(), before + 1)
+        finally:
+            lock.close()
+        self.assertEqual(self.open_fd_count(), before)
+        # The released slot is usable again.
+        again = self.supervisor._wait_for_slot('qwen', DEFAULT_QWEN_CONCURRENCY, str(uuid.uuid4()))
+        self.assertIsNotNone(again)
+        again.close()
+
+    def test_refused_slot_lock_leaves_no_descriptor_open(self):
+        unsafe = self.runtime/'locks'/'qwen.0.lock'
+        unsafe.write_bytes(b'')
+        os.chmod(unsafe, 0o644)
+        before = self.open_fd_count()
+        with self.assertRaises(WorkerSetupError) as caught:
+            self.supervisor._wait_for_slot('qwen', DEFAULT_QWEN_CONCURRENCY, str(uuid.uuid4()))
+        self.assertEqual(caught.exception.code, 'CONFIG_ERROR')
+        self.assertEqual(self.open_fd_count(), before)
+
+    def test_job_cancelled_while_queued_releases_the_slot_without_a_process(self):
+        job_id = str(uuid.uuid4())
+        request = parse_request(self.request(), (self.root,))
+        self.supervisor.state.create_job(job_id, request, 'fake-v1', 'test worker', 'fake-1')
+        self.assertTrue(self.supervisor.state.cancel_queued(job_id))
+        before = self.open_fd_count()
+        # Even with a slot free, a cancelled queued job hands it straight back.
+        self.assertIsNone(self.supervisor._wait_for_slot('qwen', 1, job_id))
+        self.assertEqual(self.open_fd_count(), before)
+        other = self.supervisor._wait_for_slot('qwen', 1, str(uuid.uuid4()))
+        self.assertIsNotNone(other)
+        other.close()
+
+
+class SlotLockSecurityTests(ConcurrencyFixture):
+    """Slot locks must be private to this user; unsafe ones fail closed."""
+
+    def assert_failed_closed(self, worker='qwen'):
+        job_id = str(uuid.uuid4())
+        result = self.supervisor.run(self.request(worker=worker), SlotAdapter(worker, 'success'),
+                                     job_id=job_id)
+        self.assertEqual(result.status, 'failed', result.json())
+        self.assertEqual(result.error['code'], 'CONFIG_ERROR')
+        job = self.job(job_id)
+        self.assertIsNone(job['started_at'])  # no worker process was started
+        self.assertIsNone(job['pid'])
+        self.assertEqual([event['event'] for event in job['events']], ['queued', 'failed'])
+
+    def test_group_readable_slot_lock_is_refused_and_never_repaired(self):
+        lock = self.runtime/'locks'/'qwen.0.lock'
+        lock.write_bytes(b'')
+        os.chmod(lock, 0o640)
+        self.assert_failed_closed()
+        self.assertEqual(stat.S_IMODE(lock.stat().st_mode), 0o640)
+        self.assertEqual(lock.read_bytes(), b'')
+
+    def test_symlinked_slot_lock_is_refused_without_touching_its_target(self):
+        outside = self.root/'outside.lock'
+        outside.write_bytes(b'held-by-someone-else')
+        os.chmod(outside, 0o600)
+        (self.runtime/'locks'/'qwen.0.lock').symlink_to(outside)
+        self.assert_failed_closed()
+        self.assertTrue((self.runtime/'locks'/'qwen.0.lock').is_symlink())
+        self.assertEqual(outside.read_bytes(), b'held-by-someone-else')
+
+    def test_slot_lock_that_is_not_a_regular_file_is_refused(self):
+        (self.runtime/'locks'/'qwen.0.lock').mkdir(mode=0o700)
+        self.assert_failed_closed()
+
+    def test_hard_linked_slot_lock_is_refused_then_accepted_once_removed(self):
+        lock = self.runtime/'locks'/'qwen.0.lock'
+        lock.write_bytes(b'')
+        os.chmod(lock, 0o600)
+        os.link(lock, self.runtime/'locks'/'qwen.0.copy')
+        self.assert_failed_closed()
+        self.assertEqual(os.stat(lock).st_nlink, 2)
+        os.unlink(self.runtime/'locks'/'qwen.0.copy')
+        result = self.supervisor.run(self.request(), SlotAdapter('qwen', 'success'),
+                                     job_id=str(uuid.uuid4()))
+        self.assertEqual(result.status, 'completed', result.json())
+
+    def test_kimi_slot_locks_are_validated_too(self):
+        lock = self.runtime/'locks'/'kimi.0.lock'
+        lock.write_bytes(b'')
+        os.chmod(lock, 0o604)
+        self.assert_failed_closed('kimi')
+
+
 class WorkspaceStateIsolationTests(unittest.TestCase):
     """Per-job adapter runtime maps stay isolated when jobs overlap."""
 
@@ -239,7 +356,14 @@ class WorkspaceStateIsolationTests(unittest.TestCase):
             name = 'fake'
 
             def build_environment(self, job_id=None):
-                return {}
+                # Mirrors the real adapters: a prepared job gets its own
+                # environment, anything else falls back to a shared baseline.
+                if job_id is not None:
+                    with self._dirs_lock:
+                        job_env = self._job_env.get(job_id)
+                    if job_env is not None:
+                        return dict(job_env)
+                return {'SHARED': 'baseline'}
 
         adapter = Bare()
         adapter._init_workspace(runtime_tmp)
@@ -251,13 +375,18 @@ class WorkspaceStateIsolationTests(unittest.TestCase):
             with adapter._dirs_lock:
                 adapter._job_dirs[job_id] = job_dir
                 adapter._job_env[job_id] = {'TMPDIR': str(job_dir)}
+        self.assertEqual(adapter.build_environment('job-a'), {'TMPDIR': str(dirs['job-a'])})
+        self.assertEqual(adapter.build_environment('job-b'), {'TMPDIR': str(dirs['job-b'])})
         self.assertNotEqual(adapter.build_environment('job-a'), adapter.build_environment('job-b'))
+        self.assertEqual(adapter.build_environment('job-unknown'), {'SHARED': 'baseline'})
         adapter.cleanup('job-a')
         with adapter._dirs_lock:
             self.assertNotIn('job-a', adapter._job_dirs)
             self.assertNotIn('job-a', adapter._job_env)
             self.assertEqual(adapter._job_dirs['job-b'], dirs['job-b'])
             self.assertEqual(adapter._job_env['job-b'], {'TMPDIR': str(dirs['job-b'])})
+        # The cleaned job keeps no stale per-job state of its own.
+        self.assertEqual(adapter.build_environment('job-a'), {'SHARED': 'baseline'})
         self.assertFalse(dirs['job-a'].exists())
         self.assertTrue(dirs['job-b'].exists())
         shutil.rmtree(dirs['job-b'])
