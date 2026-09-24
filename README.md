@@ -65,13 +65,20 @@ ai-worker jobs [--json]
 ai-worker show JOB_UUID [--json]
 ai-worker cancel JOB_UUID [--json]
 ai-worker status [--json]
+ai-worker dashboard                  # optional UI at http://127.0.0.1:8787/
+ai-worker cleanup --dry-run          # preview expired local records (default)
+ai-worker cleanup --confirm          # purge eligible terminal records after review
 ```
+
+The dashboard has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It shows safe provider/model/endpoint metadata, supports fixed small Qwen/Kimi smoke tests, cancellation, and a two-step retention purge. It accepts no arbitrary worker prompt or shell command. Refreshes do not contact providers. Model and endpoint edits are intentionally not available in the UI; only the locally verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. Do not enter credentials into ai-router.
+
+Local job records use a 30-day retention period. The default cleanup is a dry run. It protects active jobs and retained Kimi isolated-edit worktrees/history and never deletes Qwen/Kimi provider histories. Purging records is not guaranteed secure erasure on SSDs or snapshot-backed filesystems.
 
 ## Security and limits
 
 Workers run as the same Unix user. Qwen plan mode and CLI tool restrictions are application-level protections, not an OS read sandbox; do not delegate material that must remain private from the selected external provider. Repository instructions are untrusted data and cannot expand permissions. ai-router stores sanitized operational metadata/results under `~/.local/state/ai-workers`; task summaries and results may contain proprietary information. Qwen and Kimi may have provider-side retention governed by their own services and account terms.
 
-Claude's Anthropic traffic never passes through ai-worker. ai-router does not read Claude credentials, copy provider credentials, make direct provider HTTP calls, or provide a general-purpose shell endpoint. The worker supervisor works without any dashboard; a dashboard is not implemented yet.
+Claude's Anthropic traffic never passes through ai-worker. ai-router does not read Claude credentials, copy provider credentials, make direct provider HTTP calls, or provide a general-purpose shell endpoint. The worker supervisor works without the optional dashboard.
 
 ## Tests
 

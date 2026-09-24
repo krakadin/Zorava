@@ -173,6 +173,73 @@ class StateStore:
         with self.connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?', (limit,))]
 
+    def dashboard_jobs(self, *, limit=200, worker=None, status=None, search=None, date_utc=None):
+        clauses = []
+        args = []
+        if worker in ('qwen', 'kimi'):
+            clauses.append('worker=?'); args.append(worker)
+        if status:
+            clauses.append('status=?'); args.append(status)
+        if isinstance(date_utc,str) and len(date_utc)==10 and date_utc[4]=='-' and date_utc[7]=='-':
+            clauses.append('substr(created_at,1,10)=?'); args.append(date_utc)
+        if search:
+            clauses.append('(task_summary LIKE ? OR cwd LIKE ? OR worker LIKE ?)')
+            term = '%' + search[:120].replace('%', r'\%').replace('_', r'\_') + '%'
+            args.extend((term, term, term))
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        query = ('SELECT id,worker,role,requested_model,worker_version,reported_model,cwd,mode,task_summary,status,'
+                 'created_at,started_at,completed_at,duration_ms,exit_code,result,partial_result,error_code,error_message,'
+                 'usage_json,parent_job_id,delegation_group_id,job_type FROM jobs' + where +
+                 ' ORDER BY created_at DESC LIMIT ?')
+        args.append(max(1, min(int(limit), 500)))
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(query, args)]
+
+    def dashboard_events(self, *, limit=250, worker=None, errors_only=False):
+        clauses = []
+        args = []
+        if worker in ('qwen', 'kimi'):
+            clauses.append('j.worker=?'); args.append(worker)
+        if errors_only:
+            clauses.append("(e.event IN ('failed','timed_out','cancelled','auth_error','rate_limited','invalid_output') OR j.error_code IS NOT NULL)")
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        query = ('SELECT e.timestamp,e.event,e.detail,e.job_id,j.worker,j.cwd,j.requested_model,j.error_code '
+                 'FROM job_events e JOIN jobs j ON j.id=e.job_id' + where +
+                 ' ORDER BY e.sequence DESC LIMIT ?')
+        args.append(max(1, min(int(limit), 500)))
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(query, args)]
+
+    def dashboard_counts(self):
+        with self.connect() as db:
+            rows = db.execute("SELECT status,COUNT(*) AS count FROM jobs WHERE created_at >= ? GROUP BY status",
+                              (datetime.now(timezone.utc).replace(hour=0,minute=0,second=0,microsecond=0).isoformat(),)).fetchall()
+            today = {row['status']: row['count'] for row in rows}
+            active = db.execute("SELECT worker,COUNT(*) AS count FROM jobs WHERE status IN ('queued','running') GROUP BY worker").fetchall()
+            active_counts = {row['worker']: row['count'] for row in active}
+            return {'today': today, 'active': active_counts}
+
+    def cleanup_candidates(self, cutoff: str):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT id,worker,mode,status,created_at FROM jobs WHERE created_at < ? AND status NOT IN ('queued','running') ORDER BY created_at",
+                (cutoff,))]
+
+    def delete_jobs(self, job_ids):
+        ids = [str(value) for value in job_ids]
+        if not ids:
+            return 0
+        placeholders = ','.join('?' for _ in ids)
+        with self.connect() as db:
+            db.execute(f'''DELETE FROM job_events WHERE job_id IN (
+                SELECT id FROM jobs WHERE id IN ({placeholders}) AND status NOT IN ('queued','running')
+            )''', ids)
+            cursor = db.execute(f"DELETE FROM jobs WHERE id IN ({placeholders}) AND status NOT IN ('queued','running')", ids)
+            deleted = cursor.rowcount
+        with self.connect() as db:
+            db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        return deleted
+
     def request_cancel(self, job_id):
         with self.connect() as db:
             cur = db.execute("UPDATE jobs SET cancel_requested=1 WHERE id=? AND status='running'", (job_id,))

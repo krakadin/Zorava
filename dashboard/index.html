@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="csrf-token" content="%%CSRF_TOKEN%%">
+  <title>AI Worker Dashboard</title>
+  <link rel="stylesheet" href="/static/dashboard.css">
+  <script src="/static/app.js" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="/?page=overview">AI WORKERS <span>LOCAL OPERATIONS</span></a>
+    <div class="top-state"><span class="dot dot-blue"></span> WORKER MODE: READ ONLY <span class="muted">· localhost only</span></div>
+  </header>
+  <div class="layout">
+    <nav aria-label="Main navigation">
+      <a href="/?page=overview" data-nav="overview">Overview</a>
+      <a href="/?page=jobs" data-nav="jobs">Jobs</a>
+      <a href="/?page=providers" data-nav="providers">Providers</a>
+      <a href="/?page=permissions" data-nav="permissions">Permissions</a>
+      <a href="/?page=logs" data-nav="logs">Logs</a>
+      <a href="/?page=settings" data-nav="settings">Settings</a>
+    </nav>
+    <main id="app" tabindex="-1">
+      <p class="loading">Loading local worker state…</p>
+    </main>
+  </div>
+  <footer>ai-router · local state only · provider credentials remain with their CLIs</footer>
+</body>
+</html>

@@ -29,7 +29,9 @@ The requested working directory is resolved and must be beneath `/home/krakadin/
 
 Runtime root and subdirectories are owner-only (0700); SQLite and task files are owner-only (0600). Result, diagnostic, and event text is redacted before persistence. Raw provider output is not stored. Redaction covers common bearer/API-key/token/cookie/private-key forms as defense in depth; it cannot make arbitrary secret-bearing data safe. Do not intentionally put secrets in a task.
 
-Job summaries, normalized results, and errors may contain proprietary source context. They are stored locally under `~/.local/state/ai-workers` with a 30-day cleanup policy planned but not yet implemented. Kimi separately retains native session history; ai-router does not delete it.
+Job summaries, normalized results, and errors may contain proprietary source context. They are stored locally under `~/.local/state/ai-workers`. A 30-day cleanup is implemented: `ai-worker cleanup --dry-run` previews, and `ai-worker cleanup --confirm` purges eligible terminal jobs/events. Active jobs and per-job directories containing retained Kimi isolated-edit worktrees/session history are protected. Cleanup does not delete provider-owned histories. Deletion is not guaranteed secure erasure, particularly on SSDs or snapshot-backed filesystems. Kimi separately retains native session history; ai-router does not delete it.
+
+The optional operations dashboard binds only to `127.0.0.1`, validates Host/Origin/CSRF for state-changing requests, emits restrictive browser security headers, and has no arbitrary task or shell endpoint. Provider smoke-test buttons make small live calls; refreshes do not call providers. Dashboard tests are tracked as normal jobs and are canceled on graceful dashboard shutdown; ordinary CLI-launched jobs do not depend on the dashboard.
 
 ## Threat model and limitations
 

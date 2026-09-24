@@ -109,7 +109,8 @@ class QwenAdapter:
         env_cfg = settings.get('env') if isinstance(settings, dict) else None
         credential_present = isinstance(env_cfg, dict) and isinstance(env_cfg.get('DASHSCOPE_API_KEY'), str) and bool(env_cfg.get('DASHSCOPE_API_KEY'))
         return {'provider': QWEN_PROVIDER, 'endpoint_host': 'token-plan.maas.qwencloudapi.com',
-                'cli_model': QWEN_MODEL, 'credential_present': credential_present}
+                'base_url': QWEN_TOKEN_PLAN_URL, 'cli_model': QWEN_MODEL,
+                'credential_present': credential_present}
 
     def build_command(self, request: WorkerRequest, job_id: str) -> list[str]:
         self.configuration_info()

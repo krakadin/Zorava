@@ -19,6 +19,7 @@ sys.path.insert(0, str(PROJECT))
 from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT, RequestError
 from ai_router.landlock import LandlockUnavailable, landlock_abi
 from ai_router.state import StateStore
+from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.supervisor import Supervisor
 from workers.kimi import KimiAdapter
 from workers.qwen import QwenAdapter
@@ -63,10 +64,10 @@ def read_stdin(limit: int) -> bytes:
     return data
 
 
-def run_request(raw: bytes, *, job_type='delegation') -> tuple[dict, int]:
+def run_request(raw: bytes, *, job_type='delegation', job_id=None) -> tuple[dict, int]:
     try:
         supervisor, _ = build_supervisor()
-        result = supervisor.run(raw, job_type=job_type)
+        result = supervisor.run(raw, job_type=job_type, job_id=job_id)
     except RequestError as exc:
         return error_result(exc.code, str(exc)), EXIT_CODES.get(exc.code, 2)
     except (OSError, RuntimeError, ValueError, sqlite3.Error) as exc:
@@ -107,7 +108,7 @@ def command_test(args) -> int:
                'mode': 'read-only', 'timeout_seconds': 120}
     if args.worker == 'qwen':
         request['max_tool_calls'] = 0
-    value, code = run_request(json.dumps(request).encode('utf-8'), job_type='provider_test')
+    value, code = run_request(json.dumps(request).encode('utf-8'), job_type='provider_test', job_id=args.job_id)
     expected = f'{args.worker.upper()}_WORKER_OK'
     if value.get('status') == 'completed':
         received = (value.get('result') or '').strip()
@@ -232,7 +233,8 @@ def command_status(args) -> int:
             'last_test_at': last_tests['kimi'].get('completed_at') if last_tests['kimi'] else None,
             'last_test_status': last_tests['kimi'].get('status') if last_tests['kimi'] else None,
         },
-        'dashboard': 'not implemented',
+        'dashboard': {'available': True, 'default_url': 'http://127.0.0.1:8787/',
+                      'status': 'not checked; dashboard is optional'},
         'runtime': str(RUNTIME),
     }
     if args.json:
@@ -246,7 +248,7 @@ def command_status(args) -> int:
             print(f"  Routing: {info['routing']}")
         else:
             print(f"  Last live test: {info['last_test_at'] or 'not performed'}")
-    print('\nDashboard: not implemented (worker CLI operates independently)')
+    print('\nDashboard: available at http://127.0.0.1:8787/ when started; worker CLI operates independently')
     return 0
 
 
@@ -369,6 +371,39 @@ def command_cancel(args) -> int:
     return emit_json(value, code) if args.json else print_human(value, code)
 
 
+def command_cleanup(args) -> int:
+    try:
+        store = StateStore(RUNTIME / 'workers.db')
+        if args.confirm:
+            result = apply_cleanup(store, RUNTIME, retention_days=DEFAULT_RETENTION_DAYS)
+            value = {'schema_version':1, 'status':'completed', 'retention_days':DEFAULT_RETENTION_DAYS,
+                     'eligible_count':result['eligible_count'], 'protected_count':result['protected_count'],
+                     'deleted_count':result['deleted_count']}
+        else:
+            result = preview_cleanup(store, RUNTIME, retention_days=DEFAULT_RETENTION_DAYS)
+            value = {'schema_version':1, 'status':'dry_run', 'retention_days':DEFAULT_RETENTION_DAYS,
+                     'eligible_count':result['eligible_count'], 'protected_count':result['protected_count'],
+                     'eligible':result['eligible'], 'protected':result['protected']}
+        return emit_json(value) if args.json else print_human({'result':json.dumps(value,ensure_ascii=False,indent=2)})
+    except (OSError, RuntimeError, ValueError, sqlite3.Error):
+        value = error_result('CLEANUP_FAILED','Expired ai-router history could not be inspected safely.')
+        return emit_json(value,3) if args.json else print_human(value,3)
+
+
+def command_dashboard(args) -> int:
+    from dashboard.server import serve
+    try:
+        serve(host='127.0.0.1', port=args.port)
+        return 0
+    except OSError as exc:
+        if exc.errno == 98:
+            message = f'127.0.0.1:{args.port} is already in use; no process was stopped.'
+        else:
+            message = 'Dashboard could not bind to the requested loopback port.'
+        print(message, file=sys.stderr)
+        return 3
+
+
 def make_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog='ai-worker', description='Local read-only AI worker supervisor.')
     commands = parser.add_subparsers(dest='command', required=True)
@@ -385,6 +420,7 @@ def make_parser() -> argparse.ArgumentParser:
     test = commands.add_parser('test', help='Run a small live provider smoke test.')
     test.add_argument('worker', choices=('qwen','kimi'))
     test.add_argument('--json', action='store_true')
+    test.add_argument('--job-id', help=argparse.SUPPRESS)
     test.set_defaults(func=command_test)
     preflight = commands.add_parser('preflight', help='Check worker executable/configuration locally; no provider call.')
     preflight.add_argument('worker', choices=('qwen','kimi'), nargs='?', default='kimi')
@@ -413,6 +449,15 @@ def make_parser() -> argparse.ArgumentParser:
     cancel.add_argument('job_id')
     cancel.add_argument('--json', action='store_true')
     cancel.set_defaults(func=command_cancel)
+    cleanup = commands.add_parser('cleanup', help='Preview or confirm purging expired ai-router job history (30 days).')
+    cleanup_mode = cleanup.add_mutually_exclusive_group()
+    cleanup_mode.add_argument('--dry-run', action='store_true', help='Preview (the default).')
+    cleanup_mode.add_argument('--confirm', action='store_true', help='Permanently purge eligible expired records.')
+    cleanup.add_argument('--json', action='store_true')
+    cleanup.set_defaults(func=command_cleanup)
+    dashboard = commands.add_parser('dashboard', help='Run the local-only operations dashboard.')
+    dashboard.add_argument('--port', type=int, default=8787)
+    dashboard.set_defaults(func=command_dashboard)
     return parser
 
 

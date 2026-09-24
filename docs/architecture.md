@@ -43,6 +43,10 @@ The Kimi process is additionally launched under Linux Landlock (tested locally a
 
 On completion, ai-worker returns the worktree location and a bounded sanitized diff. Nothing is copied into the primary checkout. Claude reviews the diff; the user controls any later import. `ai-worker diff JOB_UUID` re-reads it, and `ai-worker discard JOB_UUID --confirm` explicitly removes only that job's worktree and per-job Kimi history. There is no automatic commit, merge, push, test execution, or deployment.
 
-## Future work
+## Optional local dashboard
 
-The dashboard is deferred. ACP and a daemon are not required. OS-level read confinement, persistent ACP sessions, and automated patch import remain future work.
+`ai-worker dashboard` starts a standard-library HTTP server on `127.0.0.1:8787`. It reads the same SQLite job state and invokes only predefined provider-test, cancellation, and retention actions. It does not accept arbitrary prompts, expose a shell, or serve arbitrary filesystem paths. It is not required for synchronous Claude delegation; no daemon or systemd service is required.
+
+The UI shows safe provider configuration metadata, cached health, jobs, sanitized event logs, permission summaries, and retention settings. Model and endpoint changes are not exposed as form inputs. Only the locally verified Qwen Token Plan and Kimi Code K3 profiles are enabled. Add/switch models only through a separately verified configuration change; credentials remain provider-owned.
+
+Local job records have 30-day retention. `ai-worker cleanup --dry-run` previews eligible records and `ai-worker cleanup --confirm` removes eligible terminal job/event rows. Active jobs and retained Kimi worktree/session directories are protected. Native provider histories remain provider-owned. ACP, persistent sessions, and OS-level read confinement remain future work.

@@ -2,7 +2,7 @@
 
 ## Normal use
 
-Start Claude normally with `claude`. For user-directed work in that active session, ask Claude to delegate a bounded investigation to Qwen or coding analysis to Kimi. Claude invokes `ai-worker` synchronously, receives JSON, and remains responsible for checking the findings. Qwen is not run on a schedule or as unattended/bulk work. The dashboard is deferred and is not required.
+Start Claude normally with `claude`. For user-directed work in that active session, ask Claude to delegate a bounded investigation to Qwen or coding analysis to Kimi. Claude invokes `ai-worker` synchronously, receives JSON, and remains responsible for checking the findings. Qwen is not run on a schedule or as unattended/bulk work. The optional dashboard is not required.
 
 ## Commands
 
@@ -15,6 +15,9 @@ ai-worker test qwen                 # explicit small live Token Plan request
 ai-worker test kimi                 # explicit small live provider call
 ai-worker test qwen --json
 ai-worker test kimi --json
+ai-worker dashboard                  # optional UI at http://127.0.0.1:8787/
+ai-worker cleanup --dry-run          # default; preview eligible records older than 30 days
+ai-worker cleanup --confirm          # permanently purge eligible records
 printf '%s' 'Investigate the authentication flow; cite paths, do not modify.' |
   ai-worker delegate qwen --cwd "$PWD" --json
 printf '%s' 'Investigate the configuration loader.' |
@@ -27,6 +30,12 @@ ai-worker diff JOB_UUID --json
 ai-worker cancel JOB_UUID
 ai-worker discard JOB_UUID --confirm  # permanently removes this job's isolated worktree/history
 ```
+
+The dashboard is loopback-only and has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It supports fixed small provider tests, cancellation, filtering history, and a two-step retention purge. It accepts no arbitrary worker task and exposes no shell endpoint. Provider tests are live provider calls; page refreshes use cached/local state only. Start it with `ai-worker dashboard`; Ctrl+C stops the dashboard.
+
+Provider cards show the configured model/backend and safe endpoint metadata. The UI intentionally does not change model URLs or accept credentials. Only the currently verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. A different model requires a separately verified configuration change. Never put a provider token in ai-router.
+
+Retention is 30 days for terminal ai-router jobs/results/events. The default cleanup previews; `--confirm` purges eligible records. Active jobs and per-job directories containing retained isolated-edit worktrees/session history are protected. Provider CLI histories/settings are never touched. Deletion is not guaranteed secure erasure, especially on SSDs or snapshot-backed filesystems.
 
 Read-only is the default. Use `isolated-edit` only when the user explicitly asks Kimi to implement a change. It requires a clean primary Git checkout and Linux Landlock; otherwise the job fails without starting Kimi. Delegation task text is read from stdin. The exact supported timeout range is 10–1800 seconds. Default Kimi timeout is 600 seconds. Allowed working directories must canonicalize beneath `/home/krakadin/myDev`.
 

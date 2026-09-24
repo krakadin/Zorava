@@ -150,7 +150,7 @@ class Supervisor:
             except ProcessLookupError: pass
         return True, 'CANCEL_REQUESTED'
 
-    def run(self, raw_request: bytes, adapter_override=None, job_type='delegation') -> RunResult:
+    def run(self, raw_request: bytes, adapter_override=None, job_type='delegation', job_id=None) -> RunResult:
         request = parse_request(raw_request,self.allowed_roots)
         adapter = adapter_override or self.adapters.get(request.worker)
         if adapter is None or adapter.name != request.worker:
@@ -158,7 +158,13 @@ class Supervisor:
         worker_version = adapter.version()
         if not isinstance(worker_version, str) or not worker_version:
             raise ValueError('Worker version could not be determined.')
-        job_id = str(uuid.uuid4())
+        if job_id is None:
+            job_id = str(uuid.uuid4())
+        else:
+            try:
+                job_id = str(uuid.UUID(job_id))
+            except (ValueError, AttributeError, TypeError):
+                raise ValueError('Invalid preassigned job identifier.') from None
         self.state.create_job(job_id,request,adapter.requested_model,adapter.role,worker_version,job_type)
         lock_path = self.runtime/'locks'/f'{request.worker}.lock'
         lock_fd = os.open(lock_path,os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
