@@ -10,7 +10,9 @@ import stat
 import subprocess
 
 from ai_router.request import WorkerRequest
+from ai_router.settings import READ_ONLY_QWEN_BUDGET, UNLIMITED_TOOL_CALLS
 from .base import ParsedOutput, WorkerSetupError, common_child_environment
+from .workspace import IsolatedWorkspace
 
 
 QWEN_EXECUTABLE = Path('/home/krakadin/.local/bin/qwen')
@@ -34,23 +36,39 @@ _DENY_TOOLS = (
     'read_mcp_resource', 'enter_worktree', 'exit_worktree', 'workflow',
     'save_memory', 'request_shutdown', 'ask_user_question', 'structured_output',
     'todo_write', 'zoom_image', 'lsp', 'exit_plan_mode', 'team_plan_approval',
+    'get_goal', 'update_goal', 'list_agents', 'report_findings', 'record_artifact',
 )
-class QwenAdapter:
+class QwenAdapter(IsolatedWorkspace):
     name = 'qwen'
-    role = 'Qwen Researcher'
+    role = 'Qwen Coder'
     requested_model = QWEN_MODEL
 
     def __init__(self, runtime_tmp: Path, executable: Path = QWEN_EXECUTABLE,
                  settings_path: Path = QWEN_SETTINGS):
-        self.runtime_tmp = runtime_tmp
+        self._init_workspace(runtime_tmp)
+        self.editor_profile = QWEN_PROFILE.with_name('qwen-editor.md')
         self.executable = executable
         self.settings_path = settings_path
 
     def build_environment(self, job_id: str | None = None) -> dict[str, str]:
+        if job_id is not None:
+            with self._dirs_lock:
+                job_env = self._job_env.get(job_id)
+            if job_env is not None:
+                return dict(job_env)
         # Qwen reads its own credential from ~/.qwen/settings.json. In
         # particular, do not inherit DASHSCOPE_API_KEY or any other provider
         # secret from the Claude parent environment.
         return common_child_environment()
+
+    def _prepare_editor(self, job_dir: Path, worktree: Path) -> dict[str, str]:
+        self.configuration_info()
+        self._write_private(job_dir / 'mcp.json', json.dumps(self._mcp_config(job_dir, worktree)).encode())
+        runtime = job_dir / 'qwen-runtime'
+        runtime.mkdir(mode=0o700)
+        env = self.build_environment()
+        env['QWEN_RUNTIME_DIR'] = str(runtime)
+        return env
 
     def version(self) -> str:
         self._validate_executable()
@@ -114,8 +132,33 @@ class QwenAdapter:
 
     def build_command(self, request: WorkerRequest, job_id: str) -> list[str]:
         self.configuration_info()
+        if request.mode == 'isolated-edit':
+            with self._dirs_lock:
+                job_dir = self._job_dirs.get(job_id)
+                worktree = self._worktrees.get(job_id)
+            if job_dir is None or worktree is None:
+                raise WorkerSetupError('CONFIG_ERROR', 'Isolated Qwen workspace was not prepared.')
+            tool_names = [f'mcp__aiworker__{name}' for name in
+                          ('get_task', 'list_files', 'read_file', 'search_text', 'write_file', 'replace_in_file')]
+            # Isolated-edit coding defaults to unlimited (-1); the supervisor
+            # applies the saved preset or explicit per-request override first.
+            inner = [str(self.executable), '--model', self.requested_model, '--safe-mode',
+                     '--auth-type', 'openai',
+                     '--approval-mode', 'auto-edit', '--output-format', 'json', '--no-chat-recording',
+                     '--max-tool-calls', str(UNLIMITED_TOOL_CALLS if request.max_tool_calls is None else request.max_tool_calls),
+                     '--max-wall-time', f'{request.timeout_seconds}s',
+                     '--mcp-config', str(job_dir / 'mcp.json'),
+                     '--allowed-mcp-server-names', 'aiworker',
+                     '--allowed-tools', *tool_names,
+                     '--exclude-tools', *_READ_TOOLS, *_DENY_TOOLS,
+                     '--system-prompt', self.editor_profile.read_text(encoding='utf-8'),
+                     'Call mcp__aiworker__get_task to receive and implement the delegated task.']
+            sandbox = Path(__file__).resolve().parent.parent / 'bin' / 'sandbox_exec.py'
+            return ['/usr/bin/python3', '-B', str(sandbox), '--write-root', str(job_dir), '--', *inner]
+        # Read-only analysis keeps the fixed small budget policy unless the
+        # request explicitly overrides it.
         command = [str(self.executable), '--model', self.requested_model,
-                   '--approval-mode', 'plan', '--max-tool-calls', str(24 if request.max_tool_calls is None else request.max_tool_calls),
+                   '--approval-mode', 'plan', '--max-tool-calls', str(READ_ONLY_QWEN_BUDGET if request.max_tool_calls is None else request.max_tool_calls),
                    '--max-wall-time', f'{request.timeout_seconds}s',
                    '--output-format', 'json', '--no-chat-recording',
                    '--core-tools', *_READ_TOOLS,
@@ -148,6 +191,8 @@ class QwenAdapter:
         if isinstance(usage, dict):
             for key, attr in (('input_tokens', 'input'), ('output_tokens', 'output'), ('cached_tokens', 'cached')):
                 value = usage.get(key)
+                if key == 'cached_tokens' and value is None:
+                    value = usage.get('cache_read_input_tokens')
                 if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
                     if attr == 'input': input_tokens = value
                     elif attr == 'output': output_tokens = value
@@ -165,6 +210,3 @@ class QwenAdapter:
             usage_result = {'input_tokens': input_tokens, 'output_tokens': output_tokens,
                             'cached_tokens': cached_tokens}
         return ParsedOutput(text.strip(), reported_model=reported_model, usage=usage_result)
-
-    def cleanup(self, job_id: str) -> None:
-        return None

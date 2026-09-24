@@ -1,6 +1,6 @@
 """Synchronous process supervisor shared by CLI and dashboard entry points."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import fcntl
 import json
 import os
@@ -16,6 +16,7 @@ import uuid
 
 from .request import parse_request, WorkerRequest
 from .security import MAX_TEXT, redact
+from .settings import SettingsError, load_qwen_coding_budget
 from .state import StateStore
 from workers.base import WorkerSetupError
 
@@ -184,7 +185,18 @@ class Supervisor:
             prepare = getattr(adapter, 'prepare_request', None)
             if callable(prepare):
                 launch_request = prepare(request,job_id)
-            command = adapter.build_command(launch_request,job_id)
+            if (request.worker == 'qwen' and request.mode == 'isolated-edit'
+                    and job_type != 'provider_test' and launch_request.max_tool_calls is None):
+                # Saved coding budget preset applies only when the request
+                # omits max_tool_calls; an explicit override always wins.
+                try:
+                    budget = load_qwen_coding_budget(self.runtime)
+                except SettingsError as exc:
+                    raise WorkerSetupError('CONFIG_ERROR', str(exc)) from None
+                launch_request = replace(launch_request,max_tool_calls=budget)
+            build_command = (getattr(adapter, 'build_test_command', adapter.build_command)
+                             if job_type == 'provider_test' else adapter.build_command)
+            command = build_command(launch_request,job_id)
             if not command or any(not isinstance(part,str) or '\x00' in part for part in command):
                 raise ValueError('Invalid worker command.')
             payload = adapter.build_payload(launch_request,job_id)
@@ -217,14 +229,25 @@ class Supervisor:
             status,code,message = self._classify(result,proc.returncode,stderr_text+'\n'+stdout_text,parsed,parse_error)
             parsed_text = parsed.text if parsed else ''
             safe_text, redactions = redact(parsed_text)
+            if job_type == 'provider_test' and status == 'completed' and safe_text.strip() != f'{request.worker.upper()}_WORKER_OK':
+                status, code, message = ('invalid_output', 'SMOKE_TEST_MISMATCH',
+                                         'Worker response did not match the expected test marker.')
             if redactions:
                 self.state.event(job_id,'security redaction',f'{redactions} sensitive-looking value(s) removed')
             partial = safe_text if status != 'completed' and safe_text else None
             final = safe_text if status == 'completed' else None
             err = {'code':code,'message':message} if code else None
+            usage = parsed.usage if parsed and status == 'completed' else None
+            collect_usage = getattr(adapter, 'collect_usage', None)
+            if usage is None and status == 'completed' and callable(collect_usage):
+                # Optional usage collection must never change the job outcome.
+                try:
+                    usage = collect_usage(job_id)
+                except Exception:
+                    pass
             self.state.finish_job(job_id,status,duration_ms=duration,exit_code=proc.returncode,
                 result=final,partial_result=partial,reported_model=parsed.reported_model if parsed else None,
-                error_code=code,error_message=message,usage=parsed.usage if parsed and status=='completed' else None)
+                error_code=code,error_message=message,usage=usage)
             persisted=self.state.get_job(job_id)
             if persisted is not None:
                 status=persisted['status']
@@ -369,6 +392,12 @@ class Supervisor:
         if result['cancelled']: return 'cancelled','CANCELLED','Cancelled by user.'
         if result['timed_out']: return 'timed_out','TIMEOUT','Worker exceeded its time limit.'
         if result['oversized']: return 'failed','OUTPUT_LIMIT','Worker output exceeded the configured limit.'
+        if exit_code == 55:
+            # Verified Qwen CLI exit for an exhausted --max-tool-calls budget.
+            # The isolated worktree and its diff are still collected; there is
+            # no automatic retry or budget increase.
+            return ('failed','BUDGET_EXHAUSTED',
+                    'Qwen tool-call budget exhausted; the saved worktree diff is retained and can be continued in a new job.')
         if exit_code != 0:
             for code,pattern in _ERROR_PATTERNS:
                 if pattern.search(diagnostic):

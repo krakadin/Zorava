@@ -15,7 +15,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from ai_router.request import RequestError, parse_request
+from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT, RequestError, parse_request
 from ai_router.security import redact, summarize
 from ai_router.state import StateStore, ensure_private_directory
 from ai_router.supervisor import Supervisor
@@ -80,19 +80,40 @@ class SupervisorFixture(unittest.TestCase):
 class RequestAndRedactionTests(SupervisorFixture):
     def test_valid_request_defaults_and_unicode(self):
         req=parse_request(json.dumps({'worker':'qwen','task':'trace café','cwd':str(self.project)}).encode(),(self.root,))
-        self.assertEqual(req.timeout_seconds,300)
-        self.assertEqual(req.mode,'read-only')
-        self.assertEqual(req.max_tool_calls,24)
+        self.assertEqual(req.timeout_seconds,1800)
+        self.assertEqual(req.mode,'isolated-edit')
+        # Omitted budgets stay unset at parse time; the supervisor applies the
+        # saved coding preset and the read-only policy keeps its fixed default.
+        self.assertIsNone(req.max_tool_calls)
         self.assertIn('café',req.task)
 
-    def test_qwen_tool_limit_is_bounded_and_zero_disables_tools(self):
-        req=parse_request(self.request(max_tool_calls=0),(self.root,))
-        self.assertEqual(req.max_tool_calls,0)
-        for value in (True,-1,25,'0'):
+    def test_default_timeout_is_thirty_minutes_for_both_coders(self):
+        self.assertEqual(DEFAULT_TIMEOUT,{'qwen':1800,'kimi':1800})
+        # The default equals the unchanged ceiling; an omitted timeout must
+        # still parse for either worker and the range stays 10-1800 seconds.
+        self.assertEqual(MAX_TIMEOUT,1800)
+        for worker in ('qwen','kimi'):
+            for mode in ('isolated-edit','read-only'):
+                with self.subTest(worker=worker,mode=mode):
+                    payload=json.dumps({'worker':worker,'task':'implement','cwd':str(self.project),
+                                        'mode':mode}).encode()
+                    self.assertEqual(parse_request(payload,(self.root,)).timeout_seconds,1800)
+        explicit=json.dumps({'worker':'kimi','task':'implement','cwd':str(self.project),
+                             'timeout_seconds':60}).encode()
+        self.assertEqual(parse_request(explicit,(self.root,)).timeout_seconds,60)
+
+    def test_qwen_tool_budget_accepts_unlimited_and_bounded_integers(self):
+        for value,expected in ((0,0),(-1,-1),(1000000,1000000),(200,200)):
+            with self.subTest(value=value):
+                req=parse_request(self.request(max_tool_calls=value),(self.root,))
+                self.assertEqual(req.max_tool_calls,expected)
+        for value in (True,-2,1000001,'0',1.5,'unlimited'):
             with self.subTest(value=value), self.assertRaises(RequestError):
                 parse_request(self.request(max_tool_calls=value),(self.root,))
         with self.assertRaises(RequestError):
             parse_request(self.request(worker='kimi',max_tool_calls=0),(self.root,))
+        with self.assertRaises(RequestError):
+            parse_request(self.request(worker='kimi',max_tool_calls=-1),(self.root,))
 
     def test_invalid_worker_and_mode_are_rejected(self):
         for changes,code in [({'worker':'other'},'INVALID_WORKER'),({'mode':'edit'},'INVALID_MODE')]:
@@ -101,12 +122,12 @@ class RequestAndRedactionTests(SupervisorFixture):
                     parse_request(self.request(**changes),(self.root,))
                 self.assertEqual(caught.exception.code,code)
 
-    def test_isolated_edit_mode_is_kimi_only(self):
-        request=parse_request(self.request(worker='kimi',mode='isolated-edit'),(self.root,))
-        self.assertEqual(request.mode,'isolated-edit')
-        with self.assertRaises(RequestError) as caught:
-            parse_request(self.request(mode='isolated-edit'),(self.root,))
-        self.assertEqual(caught.exception.code,'INVALID_MODE')
+    def test_both_coders_support_isolated_edit_and_explicit_read_only(self):
+        for worker in ('qwen','kimi'):
+            for mode in ('isolated-edit','read-only'):
+                with self.subTest(worker=worker,mode=mode):
+                    request=parse_request(self.request(worker=worker,mode=mode),(self.root,))
+                    self.assertEqual(request.mode,mode)
 
     def test_bad_json_and_size_limits(self):
         with self.assertRaises(RequestError): parse_request(b'{', (self.root,))
@@ -161,6 +182,23 @@ class RequestAndRedactionTests(SupervisorFixture):
 
 
 class StateAndProcessTests(SupervisorFixture):
+    def test_smoke_test_mismatch_is_persisted_as_failure(self):
+        result=self.supervisor.run(self.request(),job_type='provider_test')
+        self.assertEqual(result.status,'invalid_output')
+        self.assertEqual(result.error['code'],'SMOKE_TEST_MISMATCH')
+        job=self.supervisor.state.get_job(result.job_id)
+        self.assertEqual(job['error_code'],'SMOKE_TEST_MISMATCH')
+        self.assertIsNotNone(job['completed_at'])
+        self.assertIsNone(self.supervisor.state.last_successful_test('qwen'))
+
+    def test_qwen_exit_55_classifies_as_budget_exhausted(self):
+        outcome = Supervisor._classify({'cancelled':False,'timed_out':False,'oversized':False},
+                                       55, 'tool call budget exceeded', None, None)
+        status, code, message = outcome
+        self.assertEqual((status, code), ('failed', 'BUDGET_EXHAUSTED'))
+        self.assertIn('worktree', message)
+        self.assertIn('continued', message)
+
     def test_kimi_five_hour_and_weekly_limits_classify_as_quota(self):
         for diagnostic in (
             "You've reached your 5-hour usage limit. Your quota will reset when the current 5-hour window ends.",

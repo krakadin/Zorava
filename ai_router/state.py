@@ -173,6 +173,23 @@ class StateStore:
         with self.connect() as db:
             return [dict(row) for row in db.execute('SELECT * FROM jobs ORDER BY created_at DESC LIMIT ?', (limit,))]
 
+    def active_jobs(self, worker):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM jobs WHERE worker=? AND status IN ('queued','running')", (worker,))]
+
+    def provider_tests(self, worker, limit=2):
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM jobs WHERE worker=? AND job_type='provider_test' ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (worker, limit))]
+
+    def last_successful_test(self, worker):
+        with self.connect() as db:
+            row = db.execute("""SELECT completed_at FROM jobs WHERE worker=? AND job_type='provider_test'
+                AND status='completed' ORDER BY completed_at DESC, rowid DESC LIMIT 1""", (worker,)).fetchone()
+            return row['completed_at'] if row else None
+
     def dashboard_jobs(self, *, limit=200, worker=None, status=None, search=None, date_utc=None):
         clauses = []
         args = []
@@ -253,14 +270,14 @@ class StateStore:
             row = db.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
             return bool(row and row['cancel_requested'])
 
-    def stale_running(self):
-        """Mark stale rows without signalling PIDs whose ownership may be unclear."""
+    def mark_interrupted(self, job_id):
+        """Retire a running job after its caller verifies the worker has exited."""
         now = utc_now()
         with self.connect() as db:
-            rows = db.execute("SELECT id FROM jobs WHERE status='running'").fetchall()
-            for row in rows:
-                db.execute("UPDATE jobs SET status='failed',completed_at=?,error_code='SUPERVISOR_INTERRUPTED',error_message='Supervisor no longer owns this process.' WHERE id=?",
-                           (now, row['id']))
+            cursor = db.execute("""UPDATE jobs SET status='failed',completed_at=?,
+                error_code='SUPERVISOR_INTERRUPTED',error_message='Worker process exited without a recorded result.'
+                WHERE id=? AND status='running'""", (now, job_id))
+            if cursor.rowcount:
                 db.execute('INSERT INTO job_events(job_id,timestamp,event,detail) VALUES (?,?,?,?)',
-                           (row['id'], now, 'failed', 'SUPERVISOR_INTERRUPTED'))
-            return len(rows)
+                           (job_id, now, 'failed', 'SUPERVISOR_INTERRUPTED'))
+            return cursor.rowcount == 1

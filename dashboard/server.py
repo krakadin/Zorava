@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
@@ -20,9 +21,12 @@ from urllib.parse import parse_qs, urlsplit
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
+from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.security import redact
 from ai_router.state import StateStore
+from ai_router.supervisor import Supervisor
+from ai_router.updates import SOURCES, WORKERS, UpdateRegistry, requested_workers
 from workers.base import common_child_environment
 from workers.kimi import KimiAdapter
 from workers.qwen import QwenAdapter
@@ -46,6 +50,9 @@ class DashboardController:
         self._test_threads: dict[str, threading.Thread] = {}
         self._stopping = False
         self.provider_snapshot = None
+        # Cached, read-only CLI version metadata. It is only ever refreshed by
+        # an explicit operator action; dashboard GETs stay offline.
+        self.updates = UpdateRegistry()
 
     @staticmethod
     def _provider_base(adapter, name):
@@ -92,32 +99,87 @@ class DashboardController:
     def providers(self):
         if self.provider_snapshot is None:
             self.provider_snapshot = self._load_provider_snapshot()
-        rows = self.store.dashboard_jobs(limit=500)
+        with self._lock:
+            starting_workers = {worker for worker, _proc in self._test_processes.values()}
         now = datetime.now(timezone.utc)
         values = {}
         for name in ('qwen', 'kimi'):
             info = dict(self.provider_snapshot[name])
-            tests = [row for row in rows if row.get('worker') == name and row.get('job_type') == 'provider_test']
+            tests = self.store.provider_tests(name, limit=1)
             last = tests[0] if tests else None
             status = info['status']
             if last:
                 when = _parse_time(last.get('completed_at') or last.get('created_at'))
                 fresh = when is not None and (now - when).total_seconds() <= 86400
-                if last.get('error_code') == 'AUTH_ERROR': status = 'AUTH_REQUIRED'
+                if last.get('status') in ('queued', 'running'): status = 'TESTING'
+                elif last.get('error_code') == 'AUTH_ERROR': status = 'AUTH_REQUIRED'
                 elif last.get('error_code') in ('RATE_LIMITED', 'QUOTA_OR_BILLING'): status = 'DEGRADED'
                 elif last.get('status') == 'completed' and fresh: status = 'READY'
                 elif fresh: status = 'DEGRADED'
                 elif status == 'CONFIGURED': status = 'UNKNOWN'
             elif status == 'CONFIGURED':
                 status = 'UNKNOWN'
+            # The wrapper starts before its job is recorded in SQLite.
+            if name in starting_workers:
+                status = 'TESTING'
             info.update({'status': status,
+                         'last_test_id': last.get('id') if last else None,
                          'last_test_at': (last.get('completed_at') or last.get('created_at')) if last else None,
+                         'last_test_completed_at': last.get('completed_at') if last else None,
                          'last_test_status': last.get('status') if last else None,
                          'last_test_error': last.get('error_code') if last else None,
-                         'last_success_at': next((row.get('completed_at') for row in tests if row.get('status') == 'completed'), None)})
+                         'last_success_at': self.store.last_successful_test(name),
+                         'role': 'Coder', 'default_mode': 'isolated-edit'})
+            info.update(self.updates.status(name, info.get('version')).as_dict())
             values[name] = info
         values['claude'] = self.provider_snapshot['claude']
         return values
+
+    def _installed_versions(self) -> dict:
+        """Installed CLI versions from the already cached provider snapshot."""
+        snapshot = self.provider_snapshot or {}
+        versions = {}
+        for name in WORKERS:
+            info = snapshot.get(name)
+            versions[name] = info.get('version') if isinstance(info, dict) else None
+        return versions
+
+    def updates_snapshot(self) -> dict:
+        """Cache-only CLI version view; this never contacts a version source."""
+        return {'cache_only': True, 'workers': list(WORKERS), 'sources': dict(SOURCES),
+                'updates': self.updates.snapshot(self._installed_versions())}
+
+    def request_update_check(self, workers=None) -> dict:
+        """Queue bounded background version checks for the requested coders."""
+        queued = self.updates.request_check(workers)
+        return {'status': 'accepted', 'requested': queued['requested'],
+                'already_checking': queued['already_checking'], 'deferred': queued['deferred'],
+                'note': 'Read-only version metadata; nothing is downloaded or installed.',
+                'updates': self.updates.snapshot(self._installed_versions())}
+
+    def _worker_has_active_job(self, worker: str) -> bool:
+        if not self.store.active_jobs(worker):
+            return False
+        lock_path = self.runtime / 'locks' / f'{worker}.lock'
+        try:
+            fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return True
+        with os.fdopen(fd, 'rb') as lock:
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            # A child can exit while its supervisor is still saving the result.
+            # Only recover rows while holding that supervisor's worker lock.
+            for job in self.store.active_jobs(worker):
+                pgid = job.get('process_group')
+                if job['status'] == 'queued' or not isinstance(pgid, int) or pgid <= 0:
+                    return True
+                if Supervisor._group_exists(pgid):
+                    return True
+                self.store.mark_interrupted(job['id'])
+        return False
 
     def start_test(self, worker: str) -> str:
         if worker not in ('qwen', 'kimi'):
@@ -127,9 +189,7 @@ class DashboardController:
                 raise RuntimeError('Dashboard is shutting down.')
             if any(value[0] == worker for value in self._test_processes.values()):
                 raise RuntimeError('A dashboard test for this provider is already running.')
-            active = [row for row in self.store.dashboard_jobs(limit=500)
-                      if row.get('worker') == worker and row.get('status') in ('running', 'queued')]
-            if active:
+            if self._worker_has_active_job(worker):
                 raise RuntimeError('This provider already has an active worker job.')
             job_id = str(uuid.uuid4())
             command = [sys.executable, '-B', str(WORKER_SCRIPT), 'test', worker, '--json', '--job-id', job_id]
@@ -208,6 +268,8 @@ class DashboardController:
             threads = list(self._test_threads.values())
         for thread in threads:
             thread.join(timeout=5)
+        # Bounded read-only version checks are dashboard-owned background work too.
+        self.updates.shutdown(timeout=8)
 
 
 def _parse_time(value):
@@ -254,7 +316,7 @@ def _runtime_permissions(runtime: Path) -> dict:
     except OSError:
         private = False
     return {'runtime_private': private, 'runtime_mode': '0700' if private else 'unsafe or missing',
-            'dashboard_loopback': True, 'worker_mode': 'Qwen read-only; Kimi read-only by default; isolated-edit opt-in',
+            'dashboard_loopback': True, 'worker_mode': 'Qwen and Kimi coders · separate Git worktrees · diffs for review',
             'credentials_in_ai_router_config': False}
 
 
@@ -333,6 +395,8 @@ def make_handler(controller: DashboardController):
 
         def _get_api(self, path, query):
             try:
+                if path == '/api/v1/session':
+                    self._json({'csrf_token':controller.csrf_token}); return
                 if path == '/api/v1/status':
                     jobs = controller.store.dashboard_jobs(limit=100)
                     active = [row for row in jobs if row['status'] in ('running','queued')]
@@ -345,14 +409,19 @@ def make_handler(controller: DashboardController):
                     return
                 if path == '/api/v1/providers':
                     self._json({'providers':controller.providers()}); return
+                if path == '/api/v1/updates':
+                    # Cache-only: a dashboard refresh must never reach a version source.
+                    self._json(controller.updates_snapshot()); return
                 if path == '/api/v1/permissions':
-                    self._json({'qwen':{'role':'Researcher','filesystem':'Read-only plan; core tools limited to read_file, list_directory, glob, grep_search','shell':'excluded','git_writes':'off','push':'off','deploy':'off'},
-                                'kimi':{'role':'Coder','filesystem':'Read-only by default; explicit isolated-edit uses scoped worktree broker and Landlock write confinement','shell':'not exposed','git_writes':'off in read-only; edit worktree is not committed automatically','push':'off','deploy':'off'},
-                                'os_sandbox':'Qwen and Kimi read-only jobs run as the same user; no OS-level read sandbox'})
+                    coding = {'role':'Coder','filesystem':'Create and edit source files in a separate Git worktree by default; read-only mode remains available',
+                              'shell':'not exposed','git_writes':'worktree edits; diff returned for review',
+                              'push':'off','deploy':'off'}
+                    self._json({'qwen':dict(coding),'kimi':dict(coding),
+                                'os_sandbox':'Both coders use a scoped file broker and Landlock write confinement. Workers run as the same user; no OS-level read sandbox.'})
                     return
                 if path == '/api/v1/settings':
-                    self._json({'allowed_roots':['/home/krakadin/myDev'],'qwen_timeout_seconds':300,'kimi_timeout_seconds':600,
-                                'max_timeout_seconds':1800,'concurrency':{'qwen':1,'kimi':1},'retention_days':DEFAULT_RETENTION_DAYS,
+                    self._json({'allowed_roots':['/home/krakadin/myDev'],'qwen_timeout_seconds':DEFAULT_TIMEOUT['qwen'],'kimi_timeout_seconds':DEFAULT_TIMEOUT['kimi'],
+                                'max_timeout_seconds':MAX_TIMEOUT,'concurrency':{'qwen':1,'kimi':1},'default_mode':'isolated-edit','retention_days':DEFAULT_RETENTION_DAYS,
                                 'dashboard_bind':'127.0.0.1','dashboard_port':controller.port,
                                 'runtime_state':str(controller.runtime),'model_changes':'Use only locally verified provider model profiles; this dashboard does not edit provider URLs or credentials.'})
                     return
@@ -402,6 +471,14 @@ def make_handler(controller: DashboardController):
                     worker = path.rsplit('/',1)[-1]
                     job_id = controller.start_test(worker)
                     self._json({'job_id':job_id,'status':'queued','worker':worker},202); return
+                if path == '/api/v1/updates/check':
+                    # Explicit operator action only. It queues bounded read-only
+                    # version checks; nothing is downloaded, installed, or upgraded.
+                    try:
+                        result = controller.request_update_check(body.get('workers'))
+                    except ValueError as exc:
+                        return self._error(400,'INVALID_REQUEST',str(exc))
+                    self._json(result,202); return
                 if path.startswith('/api/v1/jobs/') and path.endswith('/cancel'):
                     job_id = path.split('/')[-2]
                     try: job_id = str(uuid.UUID(job_id))
@@ -451,7 +528,7 @@ def serve(host=DEFAULT_HOST, port=DEFAULT_PORT):
     if actual_host != '127.0.0.1':
         server.server_close()
         raise OSError('Dashboard did not bind to IPv4 loopback.')
-    print(f'AI Worker Dashboard\nhttp://127.0.0.1:{port}/\nPress Ctrl+C to stop.', flush=True)
+    print(f'Zorava Dashboard\nhttp://127.0.0.1:{port}/\nPress Ctrl+C to stop.', flush=True)
     try:
         server.serve_forever(poll_interval=0.25)
     except KeyboardInterrupt:

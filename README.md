@@ -1,6 +1,8 @@
-# ai-router
+# Zorava
 
-Local, user-triggered Qwen and Kimi delegation from Claude Code. Qwen is a read-only research worker; Kimi provides read-only coding analysis and explicitly requested isolated-worktree edits.
+Zorava is a local, user-triggered delegation system for Qwen and Kimi coding workers, driven from Claude Code. Both Qwen and Kimi are coding workers. Each coding job gets its own Git worktree and returns a diff for review.
+
+Zorava is the public product name. The repository directory, the `ai_router` Python package, the `ai-worker` command, and the `~/.local/state/ai-workers` runtime paths keep their existing technical names, and the text below still refers to that codebase as `ai-router`.
 
 > Do not put provider credentials in ai-router. Claude, Qwen, and Kimi retain ownership of their own authentication.
 
@@ -14,9 +16,9 @@ User -> Claude Code -> Anthropic (direct, existing Max OAuth)
                     -> ai-worker -> Kimi CLI -> Kimi Code / K3
 ```
 
-Qwen uses `/home/krakadin/.local/bin/qwen`, `qwen3.8-max`, and the existing Alibaba Model Studio Token Plan URL/key stored in Qwen's own configuration. The adapter verifies the reviewed model/endpoint pair but never receives or stores the key. Qwen runs plan mode, with read tools allowlisted, mutation/shell/agent/network tools excluded, bounded tool calls/time, JSON output, and chat recording disabled.
+Qwen uses `/home/krakadin/.local/bin/qwen`, `qwen3.8-max`, and the existing Alibaba Model Studio Token Plan URL/key stored in Qwen's own configuration. The adapter verifies the reviewed model/endpoint pair but never receives or stores the key. Qwen coding jobs use the scoped aiworker file tools, a configurable tool-call budget (unlimited by default; see below), bounded wall time, JSON output, and disabled chat recording. Its runtime files stay in the job directory while its own settings retain the credential.
 
-Kimi uses `/home/krakadin/.kimi-code/bin/kimi` and `kimi-code/k3`. Read-only analysis allows only Kimi's documented `Read`, `Grep`, and `Glob` tools. Explicit edit jobs use a clean detached Git worktree, a path-scoped MCP file broker, and tested Linux Landlock write confinement. Kimi receives no shell or native filesystem tools. The primary checkout is never automatically changed; Claude reviews the returned diff.
+Kimi uses `/home/krakadin/.kimi-code/bin/kimi` and `kimi-code/k3`. Both coders default to a clean detached Git worktree, a path-scoped MCP file broker, and tested Linux Landlock write confinement. Coding jobs receive no shell or native filesystem tools. Explicit `--mode read-only` remains available for analysis. The primary checkout is never automatically changed; Claude reviews the returned diff.
 
 The Qwen Token Plan path is limited in ai-router to synchronous user-initiated tasks in the active Claude session. This is a reasoned reading of Alibaba's interactive coding-agent rules and examples; Alibaba has not expressly endorsed this exact nested Claude-to-Qwen arrangement. ai-router does not support scheduled, unattended, bulk, or standalone service calls. See [SECURITY_CHECKPOINT.md](SECURITY_CHECKPOINT.md).
 
@@ -34,19 +36,31 @@ Use Qwen for a bounded investigation:
 
 ```bash
 printf '%s' 'Find where authentication is configured. Cite relevant paths and do not modify files.' |
-  ai-worker delegate qwen --cwd "$PWD" --json
+  ai-worker delegate qwen --cwd "$PWD" --mode read-only --json
 ```
 
 Use Kimi for coding analysis:
 
 ```bash
 printf '%s' 'Trace this bug and propose the smallest patch.' |
-  ai-worker delegate kimi --cwd "$PWD" --json
+  ai-worker delegate kimi --cwd "$PWD" --mode read-only --json
 ```
 
-The task goes through stdin rather than the process command line. Read-only is the default. Use Kimi `--mode isolated-edit` only when the user explicitly requests implementation; that requires a clean Git checkout and Landlock availability. Allowed working directories must resolve beneath `/home/krakadin/myDev`.
+The task goes through stdin rather than the process command line. Coding in `isolated-edit` mode is the default for both workers; it requires a clean Git checkout and Landlock availability. For implementation, run `ai-worker delegate qwen --cwd "$PWD" --json` or use `kimi` in place of `qwen`. Review the returned `workspace` and `diff`; changes are not automatically applied. Allowed working directories must resolve beneath `/home/krakadin/myDev`.
 
-Claude integration instructions are installed at `~/.claude/skills/delegate-workers/SKILL.md`. Start or restart Claude Code after updating the skill. Claude remains responsible for checking worker findings and responding. A Claude Bash/tool timeout must exceed the worker timeout.
+### Qwen coding tool-call budget
+
+Qwen `isolated-edit` coding jobs default to an **unlimited** tool-call budget. A per-request override wins over the saved default: add `"max_tool_calls": -1` (unlimited) or an integer `0`–`1000000` to the JSON request, or pass `--max-tool-calls unlimited|N` to `ai-worker delegate qwen`. To save a default applied to future coding jobs that omit `max_tool_calls`:
+
+```bash
+ai-worker settings show                                # inspect the saved budget (default: unlimited)
+ai-worker settings set qwen-coding-budget unlimited    # unlimited (the default)
+ai-worker settings set qwen-coding-budget 100          # or any integer 0-1000000
+```
+
+The preset is stored as user-private (0600) JSON under `~/.local/state/ai-workers/settings.json` with no credentials, and applies only to future Qwen coding jobs. Read-only analysis keeps its fixed small budget (24) unless a request overrides it, and smoke tests keep their fixed zero-tool policy. If a bounded budget is exhausted (Qwen exit 55), the job fails with `BUDGET_EXHAUSTED`; the saved worktree diff is retained and can be continued by a new job. Kimi does not support `max_tool_calls`.
+
+Claude integration instructions are installed at `~/.claude/skills/delegate-workers/SKILL.md`. Start or restart Claude Code after updating the skill. Claude remains responsible for checking worker findings and responding. A Claude Bash/tool timeout must exceed the worker timeout, which defaults to 1800 seconds (30 minutes) for both Qwen and Kimi and can be lowered with `--timeout SECONDS` (accepted range 10–1800).
 
 ## Commands
 
@@ -55,9 +69,11 @@ ai-worker --help
 ai-worker preflight [qwen|kimi] [--json]
 ai-worker test qwen [--json]
 ai-worker test kimi [--json]
-ai-worker delegate qwen --cwd PATH [--timeout SECONDS] [--json]  # read-only; task from stdin
-ai-worker delegate kimi --cwd PATH [--timeout SECONDS] [--json]  # read-only; task from stdin
-ai-worker delegate kimi --cwd PATH --mode isolated-edit --json # explicit isolated edits
+ai-worker delegate qwen --cwd PATH [--timeout SECONDS] [--max-tool-calls unlimited|N] [--json]  # isolated coding; task from stdin
+ai-worker delegate kimi --cwd PATH [--timeout SECONDS] [--json]  # isolated coding; task from stdin
+ai-worker delegate qwen|kimi --cwd PATH --mode read-only --json # analysis without edits
+ai-worker settings show                                # saved Qwen coding budget (default: unlimited)
+ai-worker settings set qwen-coding-budget unlimited|N  # save default for future Qwen coding jobs
 ai-worker diff JOB_UUID [--json]
 ai-worker discard JOB_UUID --confirm
 ai-worker run [--json]  # structured request from stdin
@@ -70,15 +86,15 @@ ai-worker cleanup --dry-run          # preview expired local records (default)
 ai-worker cleanup --confirm          # purge eligible terminal records after review
 ```
 
-The dashboard has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It shows safe provider/model/endpoint metadata, supports fixed small Qwen/Kimi smoke tests, cancellation, and a two-step retention purge. It accepts no arbitrary worker prompt or shell command. Refreshes do not contact providers. Model and endpoint edits are intentionally not available in the UI; only the locally verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. Do not enter credentials into ai-router.
+The Zorava dashboard has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It shows safe provider/model/endpoint metadata, supports fixed small Qwen/Kimi smoke tests, cancellation, and a two-step retention purge. It accepts no arbitrary worker prompt or shell command. Refreshes do not contact providers. Provider cards show the installed CLI version plus cached update metadata; `Check for upgrades` is an explicit, read-only comparison against that CLI's fixed official version source, and a pending upgrade is only labeled, never installed. Test buttons track the new job through completion, display its completion timestamp and the last successful test, and refresh their action token after dashboard restarts. Model and endpoint edits are intentionally not available in the UI; only the locally verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. Do not enter credentials into ai-router.
 
-Local job records use a 30-day retention period. The default cleanup is a dry run. It protects active jobs and retained Kimi isolated-edit worktrees/history and never deletes Qwen/Kimi provider histories. Purging records is not guaranteed secure erasure on SSDs or snapshot-backed filesystems.
+Local job records use a 30-day retention period. The default cleanup is a dry run. It protects active jobs and retained isolated-edit worktrees/runtime data and never deletes Qwen/Kimi provider histories. Purging records is not guaranteed secure erasure on SSDs or snapshot-backed filesystems.
 
 ## Security and limits
 
 Workers run as the same Unix user. Qwen plan mode and CLI tool restrictions are application-level protections, not an OS read sandbox; do not delegate material that must remain private from the selected external provider. Repository instructions are untrusted data and cannot expand permissions. ai-router stores sanitized operational metadata/results under `~/.local/state/ai-workers`; task summaries and results may contain proprietary information. Qwen and Kimi may have provider-side retention governed by their own services and account terms.
 
-Claude's Anthropic traffic never passes through ai-worker. ai-router does not read Claude credentials, copy provider credentials, make direct provider HTTP calls, or provide a general-purpose shell endpoint. The worker supervisor works without the optional dashboard.
+Claude's Anthropic traffic never passes through ai-worker. ai-router does not read Claude credentials, copy provider credentials, make provider inference calls itself, or provide a general-purpose shell endpoint. Its only outbound request is the dashboard's explicit CLI version check: one bounded, read-only HTTPS GET per worker to two fixed official sources (`registry.npmjs.org` for Qwen, `code.kimi.com` for Kimi), sent with no environment proxies, no redirects, no cookies, no `Authorization` or provider credential, and no caller-supplied URL. It compares versions and never installs or upgrades a CLI. The worker supervisor works without the optional dashboard.
 
 ## Tests
 

@@ -84,6 +84,12 @@ class KimiAdapterTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.adapter.build_command(self.request, 'f0b43ac1-7443-403c-b588-c2aa9f486c60')
 
+    def test_smoke_test_does_not_use_coding_profile_or_request_file(self):
+        command=self.adapter.build_test_command(self.request,'f0b43ac1-7443-403c-b588-c2aa9f486c60')
+        self.assertEqual(command[command.index('--prompt')+1],'Reply with exactly KIMI_WORKER_OK.')
+        self.assertIn('tools: []',Path(command[command.index('--agent-file')+1]).read_text())
+        self.assertEqual(list(self.runtime_tmp.iterdir()),[])
+
     def make_clean_repo(self):
         repo = self.root / 'git-project'
         repo.mkdir()

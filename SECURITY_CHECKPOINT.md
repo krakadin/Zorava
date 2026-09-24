@@ -148,3 +148,13 @@ Implementation boundary: one explicit Qwen delegation call per user-directed tas
 - Claude status still reports model `claude-fable-5-1[1m]`, Claude Code-managed Max OAuth, and direct Anthropic routing with no `ANTHROPIC_BASE_URL` override detected. ai-router never invoked Claude or read its credential file.
 
 The Claude user-level `delegate-workers` skill was updated to document Qwen's role and the user-directed Token Plan limits. Source/docs changed only in `/home/krakadin/myDev/ai-router`; the skill was updated at `/home/krakadin/.claude/skills/delegate-workers/SKILL.md`. No Qwen, Kimi, or Claude provider configuration was changed during this worker implementation. This updates only Checkpoint C; the dashboard and other deferred work remain separate.
+
+## User-directed update — two coding workers (2026-09-24)
+
+The user requested both Qwen and Kimi as coders and selected separate Git worktrees with diffs for review as the default. This supersedes the earlier Qwen research-only and Kimi read-only-default policy. Both adapters now share isolated-worktree creation and diff collection; explicit read-only analysis remains available. Provider credentials, models, and endpoints remain owned by the existing CLIs.
+
+Qwen coding runs with CLI customizations disabled, the explicit scoped aiworker MCP server, native tools excluded, and Landlock writes confined to its job directory. Its runtime output is redirected with `QWEN_RUNTIME_DIR`; its existing credential is not copied. Kimi retains its scoped MCP tools and Landlock confinement, including its existing provider-owned OAuth-refresh allowance. The parent reviews returned diffs and runs tests; workers do not commit, push, merge, deploy, or execute project commands.
+
+Provider tests remain fixed connectivity checks rather than coding jobs. The supervisor now validates the expected marker before persisting success. The UI follows the accepted test job to completion, refreshes the action token for open tabs, and displays the completion and last-success times.
+
+Verification: 95 offline tests passed. Qwen completed a one-file coding correction in a disposable worktree and returned the expected diff while the source stayed unchanged. Kimi implemented the CLI status regression fix and tests in an isolated snapshot; the parent reviewed and applied its two-file patch. Live dashboard tests returned exactly `QWEN_WORKER_OK` and `KIMI_WORKER_OK`, with displayed completion times advancing to 2026-09-24T02:50:05.431Z and 2026-09-24T02:50:21.172Z respectively. Browser checks covered repeated tests for both providers and stale action tokens on both Overview and Providers.

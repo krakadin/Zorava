@@ -5,11 +5,15 @@ import json
 from pathlib import Path
 import uuid
 
+from .settings import MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS
+
 
 MAX_REQUEST_BYTES = 320 * 1024
 MAX_TASK_BYTES = 32 * 1024
 MAX_CONTEXT_BYTES = 256 * 1024
-DEFAULT_TIMEOUT = {'qwen': 300, 'kimi': 600}
+# Both coders default to a 30-minute wall budget, which is also the largest
+# accepted request value; MIN_TIMEOUT/MAX_TIMEOUT bounds are unchanged.
+DEFAULT_TIMEOUT = {'qwen': 1800, 'kimi': 1800}
 MIN_TIMEOUT = 10
 MAX_TIMEOUT = 1800
 
@@ -54,11 +58,9 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
     if payload.get('worker') not in ('qwen', 'kimi'):
         raise RequestError('INVALID_WORKER', 'Worker must be qwen or kimi.')
     worker = payload['worker']
-    mode = payload.get('mode', 'read-only')
+    mode = payload.get('mode', 'isolated-edit')
     if mode not in ('read-only', 'isolated-edit'):
         raise RequestError('INVALID_MODE', 'Mode must be read-only or isolated-edit.')
-    if mode == 'isolated-edit' and worker != 'kimi':
-        raise RequestError('INVALID_MODE', 'Isolated editing is available only for Kimi.')
     task = payload.get('task')
     context = payload.get('context', '')
     if not isinstance(task, str) or not task.strip() or len(task.encode('utf-8')) > MAX_TASK_BYTES:
@@ -68,10 +70,16 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
     timeout = payload.get('timeout_seconds', DEFAULT_TIMEOUT[worker])
     if isinstance(timeout, bool) or not isinstance(timeout, int) or not MIN_TIMEOUT <= timeout <= MAX_TIMEOUT:
         raise RequestError('INVALID_TIMEOUT', 'Timeout must be between 10 and 1800 seconds.')
-    max_tool_calls = payload.get('max_tool_calls', 24 if worker == 'qwen' else None)
-    if worker == 'qwen' and (isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int)
-                             or not 0 <= max_tool_calls <= 24):
-        raise RequestError('INVALID_REQUEST', 'Qwen max_tool_calls must be between 0 and 24.')
+    # An omitted Qwen max_tool_calls stays None here: the supervisor applies
+    # the saved coding preset for isolated-edit jobs, while the read-only
+    # adapter policy keeps its fixed small default.
+    max_tool_calls = payload.get('max_tool_calls')
+    if worker == 'qwen' and max_tool_calls is not None and (
+            isinstance(max_tool_calls, bool) or not isinstance(max_tool_calls, int)
+            or (max_tool_calls != UNLIMITED_TOOL_CALLS
+                and not 0 <= max_tool_calls <= MAX_TOOL_CALLS_LIMIT)):
+        raise RequestError('INVALID_REQUEST',
+                           f'Qwen max_tool_calls must be -1 (unlimited) or an integer from 0 to {MAX_TOOL_CALLS_LIMIT}.')
     if worker == 'kimi' and max_tool_calls is not None:
         raise RequestError('INVALID_REQUEST', 'max_tool_calls is not supported by Kimi.')
     cwd = payload.get('cwd')

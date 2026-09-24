@@ -18,6 +18,8 @@ sys.path.insert(0, str(PROJECT))
 
 from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT, RequestError
 from ai_router.landlock import LandlockUnavailable, landlock_abi
+from ai_router.settings import (MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS, SettingsError,
+                                load_settings, parse_budget_token, save_settings)
 from ai_router.state import StateStore
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.supervisor import Supervisor
@@ -33,8 +35,8 @@ EXIT_CODES = {
     'PATH_NOT_ALLOWED': 2, 'PATH_ACCESS_ERROR': 2,
     'CONFIG_ERROR': 3, 'AUTH_ERROR': 4, 'WORKER_CRASH': 5,
     'WORKER_BUSY': 5, 'INVALID_OUTPUT': 5, 'OUTPUT_LIMIT': 5,
-    'MODEL_UNAVAILABLE': 5, 'RATE_LIMITED': 5, 'QUOTA_OR_BILLING': 5,
-    'NETWORK_ERROR': 5, 'TIMEOUT': 6, 'CANCELLED': 7,
+    'MODEL_UNAVAILABLE': 5, 'RATE_LIMITED': 5, 'QUOTA_OR_BILLING': 5, 'SMOKE_TEST_MISMATCH': 5,
+    'NETWORK_ERROR': 5, 'BUDGET_EXHAUSTED': 5, 'TIMEOUT': 6, 'CANCELLED': 7,
     'SANDBOX_UNAVAILABLE': 3, 'PROJECT_DIRTY': 2,
     'NOT_A_GIT_REPOSITORY': 2, 'GIT_ERROR': 3, 'GIT_WORKTREE_ERROR': 3,
 }
@@ -86,6 +88,11 @@ def command_delegate(args) -> int:
             raise RequestError('INVALID_TASK', 'Task input is empty.')
         request = {'worker': args.worker, 'task': task, 'cwd': args.cwd,
                    'mode': args.mode, 'timeout_seconds': args.timeout or DEFAULT_TIMEOUT[args.worker]}
+        if args.max_tool_calls is not None:
+            try:
+                request['max_tool_calls'] = parse_budget_token(args.max_tool_calls)
+            except SettingsError as exc:
+                raise RequestError('INVALID_REQUEST', str(exc)) from None
         value, code = run_request(json.dumps(request, ensure_ascii=False).encode('utf-8'))
     except (UnicodeDecodeError, RequestError) as exc:
         code_name = exc.code if isinstance(exc, RequestError) else 'INVALID_TASK'
@@ -170,7 +177,7 @@ def command_preflight(args) -> int:
 
 
 def command_status(args) -> int:
-    """Report local configuration and last explicit Kimi test; never calls providers."""
+    """Report local configuration and last explicit provider tests; never calls providers."""
     settings_path = Path('/home/krakadin/.claude/settings.json')
     model = None
     settings_base_override = False
@@ -185,21 +192,37 @@ def command_status(args) -> int:
     except (OSError, UnicodeError, ValueError):
         pass
     env_override = 'ANTHROPIC_BASE_URL' in os.environ
+    worker_names = ('qwen', 'kimi')
+    last_tests = {name: None for name in worker_names}
+    last_successes = {name: None for name in worker_names}
     try:
-        rows = StateStore(RUNTIME / 'workers.db').jobs(limit=100)
+        store = StateStore(RUNTIME / 'workers.db')
+        for name in worker_names:
+            tests = store.provider_tests(name, limit=1)
+            last_tests[name] = tests[0] if tests else None
+            last_successes[name] = store.last_successful_test(name)
     except (OSError, RuntimeError, sqlite3.Error):
-        rows = []
-    last_tests = {name: next((row for row in rows if row.get('worker') == name
-                              and row.get('job_type') == 'provider_test'), None)
-                  for name in ('qwen', 'kimi')}
+        pass
     provider_status = {}
     for name, last_test in last_tests.items():
         status = 'UNKNOWN'
         if last_test:
-            if last_test.get('status') == 'completed': status = 'LAST_TEST_SUCCEEDED'
+            test_status = last_test.get('status')
+            if test_status in ('queued', 'running'): status = 'TESTING'
+            elif test_status == 'completed': status = 'LAST_TEST_SUCCEEDED'
             elif last_test.get('error_code') == 'AUTH_ERROR': status = 'AUTH_REQUIRED'
             else: status = 'LAST_TEST_FAILED'
         provider_status[name] = status
+
+    def test_fields(name: str) -> dict:
+        last_test = last_tests[name]
+        return {
+            'last_test_id': last_test.get('id') if last_test else None,
+            'last_test_at': (last_test.get('completed_at') or last_test.get('created_at')) if last_test else None,
+            'last_test_status': last_test.get('status') if last_test else None,
+            'last_test_error': (last_test.get('error_code') or last_test.get('error_message')) if last_test else None,
+            'last_success_at': last_successes[name],
+        }
     try:
         qwen_info = QwenAdapter(RUNTIME/'tmp').configuration_info()
     except (OSError, RuntimeError, ValueError):
@@ -221,8 +244,7 @@ def command_status(args) -> int:
             'provider': qwen_info['provider'],
             'endpoint_host': qwen_info['endpoint_host'],
             'authentication': 'Qwen-owned credential present' if qwen_info['credential_present'] else 'Qwen credential missing',
-            'last_test_at': last_tests['qwen'].get('completed_at') if last_tests['qwen'] else None,
-            'last_test_status': last_tests['qwen'].get('status') if last_tests['qwen'] else None,
+            **test_fields('qwen'),
         },
         'kimi': {
             'status': provider_status['kimi'],
@@ -230,8 +252,7 @@ def command_status(args) -> int:
             'requested_model': 'kimi-code/k3',
             'provider': 'Kimi Code',
             'authentication': 'Kimi Code-managed OAuth; credential not inspected',
-            'last_test_at': last_tests['kimi'].get('completed_at') if last_tests['kimi'] else None,
-            'last_test_status': last_tests['kimi'].get('status') if last_tests['kimi'] else None,
+            **test_fields('kimi'),
         },
         'dashboard': {'available': True, 'default_url': 'http://127.0.0.1:8787/',
                       'status': 'not checked; dashboard is optional'},
@@ -239,7 +260,7 @@ def command_status(args) -> int:
     }
     if args.json:
         return emit_json(value)
-    print('AI Worker Status')
+    print('Zorava Status')
     for provider in ('claude', 'qwen', 'kimi'):
         info = value[provider]
         print(f"\n{provider.title()}\n  Status: {info['status']}\n  Model: {info.get('model') or info.get('requested_model') or 'unknown'}")
@@ -248,6 +269,11 @@ def command_status(args) -> int:
             print(f"  Routing: {info['routing']}")
         else:
             print(f"  Last live test: {info['last_test_at'] or 'not performed'}")
+            if info.get('last_test_id'):
+                print(f"  Last test job: {info['last_test_id']} ({info.get('last_test_status') or 'unknown'})")
+            if info.get('last_test_error'):
+                print(f"  Last test error: {info['last_test_error']}")
+            print(f"  Last successful test: {info.get('last_success_at') or 'never'}")
     print('\nDashboard: available at http://127.0.0.1:8787/ when started; worker CLI operates independently')
     return 0
 
@@ -266,7 +292,7 @@ def command_diff(args) -> int:
         if job.get('mode')!='isolated-edit':
             value=error_result('INVALID_MODE','This job has no isolated-edit worktree.')
             return emit_json(value,2) if args.json else print_human(value,2)
-        adapter=KimiAdapter(RUNTIME/'tmp')
+        adapter=(QwenAdapter if job['worker']=='qwen' else KimiAdapter)(RUNTIME/'tmp')
         workspace,diff,truncated=adapter.collect_edit_output(job_id)
         if workspace is None:
             value=error_result('WORKTREE_MISSING','The isolated worktree is unavailable.')
@@ -318,9 +344,9 @@ def command_discard(args) -> int:
             return emit_json(value,2) if args.json else print_human(value,2)
         if not args.confirm:
             value={'schema_version':1,'job_id':job_id,'status':'confirmation_required',
-                   'message':'This permanently removes the ai-router worktree and its per-job Kimi session history. Review `ai-worker diff` first, then repeat with --confirm.'}
+                   'message':'This permanently removes the ai-router worktree and its per-job worker runtime data. Review `ai-worker diff` first, then repeat with --confirm.'}
             return emit_json(value,2) if args.json else print_human({'result':value['message']},2)
-        adapter=KimiAdapter(RUNTIME/'tmp')
+        adapter=(QwenAdapter if job['worker']=='qwen' else KimiAdapter)(RUNTIME/'tmp')
         result=adapter._git(['worktree','remove','--force',str(worktree)],source,timeout=60)
         if result.returncode!=0 or worktree.exists():
             value=error_result('WORKTREE_REMOVE_FAILED','Git could not safely remove the isolated worktree.')
@@ -404,8 +430,40 @@ def command_dashboard(args) -> int:
         return 3
 
 
+def _settings_view(settings: dict) -> dict:
+    budget = settings['qwen_coding_max_tool_calls']
+    return {'qwen_coding_max_tool_calls': budget,
+            'qwen_coding_budget': 'unlimited' if budget == UNLIMITED_TOOL_CALLS else budget,
+            'applies_to': 'qwen isolated-edit jobs without an explicit max_tool_calls'}
+
+
+def command_settings_show(args) -> int:
+    try:
+        value = {'schema_version': 1, 'settings': _settings_view(load_settings(RUNTIME))}
+        return emit_json(value) if args.json else print_human({'result': json.dumps(value['settings'], ensure_ascii=False)})
+    except SettingsError as exc:
+        value = error_result(exc.code, str(exc)[:240])
+        return emit_json(value, 3) if args.json else print_human(value, 3)
+
+
+def command_settings_set(args) -> int:
+    try:
+        budget = parse_budget_token(args.value)
+    except SettingsError as exc:
+        value = error_result('INVALID_REQUEST', str(exc)[:240])
+        return emit_json(value, 2) if args.json else print_human(value, 2)
+    try:
+        saved = save_settings(RUNTIME, qwen_coding_max_tool_calls=budget)
+    except SettingsError as exc:
+        value = error_result(exc.code, str(exc)[:240])
+        return emit_json(value, 3) if args.json else print_human(value, 3)
+    value = {'schema_version': 1, 'status': 'saved', 'settings': _settings_view(saved),
+             'note': 'Applies to future Qwen coding jobs only; running jobs are unchanged.'}
+    return emit_json(value) if args.json else print_human({'result': json.dumps(value['settings'], ensure_ascii=False)})
+
+
 def make_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog='ai-worker', description='Local read-only AI worker supervisor.')
+    parser = argparse.ArgumentParser(prog='ai-worker', description='Zorava: local read-only AI worker supervisor.')
     commands = parser.add_subparsers(dest='command', required=True)
     run = commands.add_parser('run', help='Read a JSON worker request from stdin.')
     run.add_argument('--json', action='store_true', help='Emit machine-readable JSON only.')
@@ -414,7 +472,9 @@ def make_parser() -> argparse.ArgumentParser:
     delegate.add_argument('worker', choices=('qwen','kimi'))
     delegate.add_argument('--cwd', required=True)
     delegate.add_argument('--timeout', type=int)
-    delegate.add_argument('--mode', choices=('read-only','isolated-edit'), default='read-only')
+    delegate.add_argument('--mode', choices=('read-only','isolated-edit'), default='isolated-edit')
+    delegate.add_argument('--max-tool-calls',
+                          help=f"Qwen tool-call budget: 'unlimited' or 0-{MAX_TOOL_CALLS_LIMIT} (not supported for kimi).")
     delegate.add_argument('--json', action='store_true')
     delegate.set_defaults(func=command_delegate)
     test = commands.add_parser('test', help='Run a small live provider smoke test.')
@@ -426,7 +486,7 @@ def make_parser() -> argparse.ArgumentParser:
     preflight.add_argument('worker', choices=('qwen','kimi'), nargs='?', default='kimi')
     preflight.add_argument('--json', action='store_true')
     preflight.set_defaults(func=command_preflight)
-    status = commands.add_parser('status', help='Show local Claude routing and cached Kimi test status.')
+    status = commands.add_parser('status', help='Show local Claude routing and cached worker test status.')
     status.add_argument('--json', action='store_true')
     status.set_defaults(func=command_status)
     jobs = commands.add_parser('jobs', help='List recent local jobs.')
@@ -436,7 +496,7 @@ def make_parser() -> argparse.ArgumentParser:
     show.add_argument('job_id')
     show.add_argument('--json', action='store_true')
     show.set_defaults(func=command_show)
-    diff = commands.add_parser('diff', help='Show changes from a Kimi isolated-edit job.')
+    diff = commands.add_parser('diff', help='Show changes from a worker isolated-edit job.')
     diff.add_argument('job_id')
     diff.add_argument('--json', action='store_true')
     diff.set_defaults(func=command_diff)
@@ -458,6 +518,16 @@ def make_parser() -> argparse.ArgumentParser:
     dashboard = commands.add_parser('dashboard', help='Run the local-only operations dashboard.')
     dashboard.add_argument('--port', type=int, default=8787)
     dashboard.set_defaults(func=command_dashboard)
+    settings_cmd = commands.add_parser('settings', help='Show or set saved local defaults (no credentials).')
+    settings_sub = settings_cmd.add_subparsers(dest='settings_command', required=True)
+    settings_show = settings_sub.add_parser('show', help='Show the saved Qwen coding tool-call budget.')
+    settings_show.add_argument('--json', action='store_true')
+    settings_show.set_defaults(func=command_settings_show)
+    settings_set = settings_sub.add_parser('set', help='Save the default Qwen coding tool-call budget.')
+    settings_set.add_argument('key', choices=('qwen-coding-budget',))
+    settings_set.add_argument('value', help=f"'unlimited' or an integer 0-{MAX_TOOL_CALLS_LIMIT}.")
+    settings_set.add_argument('--json', action='store_true')
+    settings_set.set_defaults(func=command_settings_set)
     return parser
 
 

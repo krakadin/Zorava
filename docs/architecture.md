@@ -17,13 +17,13 @@ The project has no provider proxy. Claude's Anthropic traffic does not pass thro
 
 Qwen's adapter verifies that the current active model is `qwen3.8-max` and that both configured base URLs use `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`. It reports only endpoint hostname and credential presence; the key remains in Qwen's settings and is neither inherited nor copied by ai-router. Its requested model is explicit. No fallback model, alternate endpoint, scheduler, background worker service, or unattended/bulk path exists.
 
-## Read-only invocation
+## Coding and read-only invocation
 
-`ai-worker delegate qwen|kimi --cwd PATH --json` reads the task from stdin. The supervisor validates UTF-8, payload size, timeout, worker, mode, and canonical working-directory containment beneath `/home/krakadin/myDev`.
+`ai-worker delegate qwen|kimi --cwd PATH --json` reads the task from stdin and defaults to coding in a separate Git worktree. Both adapters share worktree creation, the scoped file broker, diff collection, and cleanup in `workers/workspace.py`. The parent reviews the returned diff; the primary checkout is not automatically changed. Use `--mode read-only` to select the analysis path described below. The supervisor validates UTF-8, payload size, timeout, worker, mode, and canonical working-directory containment beneath `/home/krakadin/myDev`.
 
-Qwen is launched using `/home/krakadin/.local/bin/qwen`, `qwen3.8-max`, plan approval mode, bounded tool calls and wall time, JSON output, and `--no-chat-recording`. Its core allowlist comprises `read_file`, `list_directory`, `glob`, and `grep_search`; the adapter excludes the installed CLI's shell, write/edit, agent, network, tool-bridge, MCP, and workflow tools. The task/context are JSON on stdin; only a fixed parent instruction is in argv. Its CLI session is synchronous, and Qwen's user-owned settings supply its own Token Plan auth.
+For read-only analysis, Qwen is launched using `/home/krakadin/.local/bin/qwen`, `qwen3.8-max`, plan approval mode, bounded tool calls and wall time, JSON output, and `--no-chat-recording`. Its core allowlist comprises `read_file`, `list_directory`, `glob`, and `grep_search`; the adapter excludes the installed CLI's shell, write/edit, agent, network, tool-bridge, MCP, and workflow tools. The task/context are JSON on stdin; only a fixed parent instruction is in argv. Its CLI session is synchronous, and Qwen's user-owned settings supply its own Token Plan auth.
 
-Kimi is launched using `/home/krakadin/.kimi-code/bin/kimi` with explicit `kimi-code/k3`, `profiles/kimi-coder.md`, and stream-JSON output.
+For read-only analysis, Kimi is launched using `/home/krakadin/.kimi-code/bin/kimi` with explicit `kimi-code/k3`, `profiles/kimi-coder.md`, and stream-JSON output.
 
 Kimi CLI prompt arguments cannot accept stdin as the task channel, so ai-router writes a short-lived request file in `~/.local/state/ai-workers/tmp/<random-job-dir>/request.json`, mode 0600 inside a 0700 directory. Kimi gets access to that one temporary directory and is asked to read the request file. The task itself is not put in process arguments. The file is removed after completion. Kimi CLI may separately retain the conversation in its own session history under `~/.kimi-code/sessions`.
 
@@ -50,3 +50,9 @@ On completion, ai-worker returns the worktree location and a bounded sanitized d
 The UI shows safe provider configuration metadata, cached health, jobs, sanitized event logs, permission summaries, and retention settings. Model and endpoint changes are not exposed as form inputs. Only the locally verified Qwen Token Plan and Kimi Code K3 profiles are enabled. Add/switch models only through a separately verified configuration change; credentials remain provider-owned.
 
 Local job records have 30-day retention. `ai-worker cleanup --dry-run` previews eligible records and `ai-worker cleanup --confirm` removes eligible terminal job/event rows. Active jobs and retained Kimi worktree/session directories are protected. Native provider histories remain provider-owned. ACP, persistent sessions, and OS-level read confinement remain future work.
+
+## Coding tools and test status
+
+Coding uses `qwen-editor.md` or `kimi-editor.md` and the same six aiworker MCP tools. Qwen uses an explicit MCP configuration, customizations disabled, and a job-scoped `QWEN_RUNTIME_DIR`; Kimi uses a job-scoped home linked to its own configuration/auth. Both run under Landlock write confinement. Git worktrees and diffs are retained for review.
+
+The dashboard retrieves provider tests directly from SQLite, independently of the recent-jobs list. Each test action gets a fresh CSRF token and follows the returned job ID until completion, then displays that completion timestamp. The supervisor records marker mismatches as failures before persisting a final job state. Kimi smoke tests use a separate profile with no tools.
