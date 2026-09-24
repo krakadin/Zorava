@@ -23,7 +23,8 @@ sys.path.insert(0, str(PROJECT))
 
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
-from ai_router.settings import SETTINGS_FIELDS, SettingsError, load_worker_concurrency
+from ai_router.settings import (SETTINGS_FIELDS, SettingsError, load_worker_concurrency,
+                                save_settings, validate_concurrency)
 from ai_router.security import redact
 from ai_router.state import StateStore
 from ai_router.supervisor import Supervisor
@@ -519,6 +520,32 @@ def make_handler(controller: DashboardController):
                     except ValueError as exc:
                         return self._error(400,'INVALID_REQUEST',str(exc))
                     self._json(result,202); return
+                if path == '/api/v1/settings/concurrency':
+                    # One worker per request. Validation and the atomic 0600
+                    # write reuse the CLI settings path, so malformed or unsafe
+                    # existing configuration fails closed instead of being
+                    # silently overwritten. Only operational integers are saved.
+                    worker = body.get('worker')
+                    if worker not in ('qwen','kimi'):
+                        return self._error(400,'INVALID_REQUEST','Worker must be qwen or kimi.')
+                    try:
+                        value = validate_concurrency(body.get('concurrency'))
+                    except SettingsError as exc:
+                        return self._error(400,'INVALID_REQUEST',str(exc))
+                    try:
+                        saved = save_settings(controller.runtime, **{f'{worker}_concurrency': value})
+                    except SettingsError:
+                        # Unsafe/malformed existing config or runtime directory;
+                        # nothing was overwritten and no detail is exposed.
+                        return self._error(500,'LOCAL_ACTION_FAILED','The requested local action failed safely.')
+                    maximum = SETTINGS_FIELDS['qwen_concurrency']['maximum']
+                    concurrency = {'qwen':saved['qwen_concurrency'],'kimi':saved['kimi_concurrency']}
+                    self._json({'status':'saved','worker':worker,'concurrency':concurrency,
+                                'concurrency_limits':{'minimum':1,'maximum':maximum},
+                                'note':f"{worker.capitalize()} concurrency is now {concurrency[worker]} "
+                                        f"(allowed 1-{maximum}); extra jobs wait queued for a free slot. "
+                                        f"Applies to future jobs only."})
+                    return
                 if path.startswith('/api/v1/jobs/') and path.endswith('/cancel'):
                     job_id = path.split('/')[-2]
                     try: job_id = str(uuid.UUID(job_id))

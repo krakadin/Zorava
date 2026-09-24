@@ -3,6 +3,7 @@ import http.client
 import json
 import os
 from pathlib import Path
+import stat
 import tempfile
 import threading
 import time
@@ -15,7 +16,7 @@ from http.server import ThreadingHTTPServer
 
 from ai_router import updates
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
-from ai_router.settings import save_settings
+from ai_router.settings import load_settings, load_worker_concurrency, save_settings, settings_path
 from ai_router.state import StateStore
 from dashboard.server import DashboardController, make_handler, serve
 
@@ -163,6 +164,114 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(kimi['queued_jobs'],0)
             self.assertEqual(kimi['running_jobs'],0)
         self.assertIsNotNone(queued_id)
+
+    def test_settings_concurrency_update_roundtrip_and_persistence(self):
+        for worker, value in (('qwen', 3), ('kimi', 2)):
+            status, _, body = self.request('POST', '/api/v1/settings/concurrency',
+                                           body=json.dumps({'worker': worker, 'concurrency': value}),
+                                           headers=self.csrf_headers())
+            self.assertEqual(status, 200, body)
+            payload = json.loads(body)
+            self.assertEqual(payload['status'], 'saved')
+            self.assertEqual(payload['worker'], worker)
+            self.assertEqual(payload['concurrency'][worker], value)
+            self.assertEqual(payload['concurrency_limits'], {'minimum': 1, 'maximum': 4})
+            self.assertIn('queue', payload['note'])
+            # The response is operational metadata only: no settings file
+            # paths or other configuration are exposed.
+            self.assertEqual(sorted(payload), ['concurrency', 'concurrency_limits', 'note', 'status', 'worker'])
+        # Persisted through the shared settings path: user-private 0600 file.
+        self.assertEqual(load_worker_concurrency(self.runtime, 'qwen'), 3)
+        self.assertEqual(load_worker_concurrency(self.runtime, 'kimi'), 2)
+        self.assertEqual(stat.S_IMODE(settings_path(self.runtime).stat().st_mode), 0o600)
+        # GET /api/v1/settings reflects the saved values; existing fields are intact.
+        status, _, body = self.request('GET', '/api/v1/settings')
+        self.assertEqual(status, 200)
+        settings = json.loads(body)
+        self.assertEqual(settings['concurrency'], {'qwen': 3, 'kimi': 2})
+        self.assertEqual(settings['concurrency_limits'], {'minimum': 1, 'maximum': 4})
+        self.assertEqual(settings['max_timeout_seconds'], MAX_TIMEOUT)
+        self.assertEqual(settings['retention_days'], 30)
+
+    def test_settings_concurrency_preserves_other_saved_settings(self):
+        save_settings(self.runtime, qwen_coding_max_tool_calls=42, qwen_concurrency=4)
+        status, _, body = self.request('POST', '/api/v1/settings/concurrency',
+                                       body=json.dumps({'worker': 'kimi', 'concurrency': 4}),
+                                       headers=self.csrf_headers())
+        self.assertEqual(status, 200, body)
+        saved = load_settings(self.runtime)
+        # Updating one worker's capacity never disturbs the budget or the
+        # other worker's saved capacity.
+        self.assertEqual(saved['qwen_coding_max_tool_calls'], 42)
+        self.assertEqual(saved['qwen_concurrency'], 4)
+        self.assertEqual(saved['kimi_concurrency'], 4)
+        self.assertEqual(json.loads(body)['concurrency'], {'qwen': 4, 'kimi': 4})
+
+    def test_settings_concurrency_rejects_invalid_values_and_workers(self):
+        cases = ({'worker': 'qwen', 'concurrency': 0},
+                 {'worker': 'qwen', 'concurrency': 5},
+                 {'worker': 'qwen', 'concurrency': -1},
+                 {'worker': 'qwen', 'concurrency': True},   # bool is not an integer
+                 {'worker': 'qwen', 'concurrency': False},
+                 {'worker': 'qwen', 'concurrency': '2'},
+                 {'worker': 'qwen', 'concurrency': 1.5},
+                 {'worker': 'qwen', 'concurrency': None},
+                 {'worker': 'qwen'},                        # missing value
+                 {'worker': 'claude', 'concurrency': 2},
+                 {'worker': 'other', 'concurrency': 2},
+                 {'worker': 2, 'concurrency': 2},
+                 {'concurrency': 2},
+                 {})
+        for payload in cases:
+            with self.subTest(payload=payload):
+                status, _, body = self.request('POST', '/api/v1/settings/concurrency',
+                                               body=json.dumps(payload), headers=self.csrf_headers())
+                self.assertEqual(status, 400, body)
+                self.assertEqual(json.loads(body)['error']['code'], 'INVALID_REQUEST')
+        # Nothing was written and defaults still apply.
+        self.assertFalse(settings_path(self.runtime).exists())
+        self.assertEqual(load_worker_concurrency(self.runtime, 'qwen'), 2)
+        self.assertEqual(load_worker_concurrency(self.runtime, 'kimi'), 1)
+        # Malformed JSON and unknown sub-paths keep their existing behavior.
+        self.assertEqual(self.request('POST', '/api/v1/settings/concurrency', body='{nope',
+                                      headers=self.csrf_headers())[0], 400)
+        self.assertEqual(self.request('POST', '/api/v1/settings/other', body='{}',
+                                      headers=self.csrf_headers())[0], 404)
+
+    def test_settings_concurrency_requires_csrf_and_same_origin(self):
+        body = json.dumps({'worker': 'qwen', 'concurrency': 3})
+        headers = self.csrf_headers(); headers['X-AI-Worker-CSRF'] = 'wrong'
+        self.assertEqual(self.request('POST', '/api/v1/settings/concurrency', body=body, headers=headers)[0], 403)
+        headers = self.csrf_headers(origin='http://attacker.example')
+        self.assertEqual(self.request('POST', '/api/v1/settings/concurrency', body=body, headers=headers)[0], 403)
+        headers = self.csrf_headers(); headers['Sec-Fetch-Site'] = 'cross-site'
+        self.assertEqual(self.request('POST', '/api/v1/settings/concurrency', body=body, headers=headers)[0], 403)
+        # Rejected requests never write, and the endpoint is POST-only.
+        self.assertFalse(settings_path(self.runtime).exists())
+        self.assertEqual(self.request('GET', '/api/v1/settings/concurrency')[0], 404)
+
+    def test_static_settings_page_exposes_bounded_concurrency_controls(self):
+        js = (Path(__file__).resolve().parents[1]/'dashboard/static/app.js').read_text(encoding='utf-8')
+        # The page moved from read-only wording to operational settings.
+        self.assertIn('Operational settings for the local workers', js)
+        self.assertNotIn('Read-only operational configuration', js)
+        self.assertIn('WORKER CONCURRENCY', js)
+        self.assertIn("dataset.action='save-concurrency'", js)
+        self.assertIn("post('/api/v1/settings/concurrency',{worker:worker,concurrency:", js)
+        # Selectors are driven by the API's own configured range.
+        self.assertIn('data.concurrency_limits', js)
+        self.assertIn('concurrency-${worker}', js)
+        # Success refreshes the page while preserving scroll; errors use flash.
+        self.assertIn('rerenderKeepingScroll(settingsPage)', js)
+        self.assertIn("catch(error){flash(error.message)}", js)
+        # Existing sections and XSS-safe rendering are preserved.
+        self.assertIn('RETENTION CLEANUP', js)
+        self.assertIn("addKV(dl,'Qwen default timeout'", js)
+        self.assertIn('textContent', js); self.assertNotIn('innerHTML', js)
+        status, _, body = self.request('GET', '/static/app.js')
+        self.assertEqual(status, 200); self.assertIn(b'save-concurrency', body)
+        status, _, body = self.request('GET', '/static/dashboard.css')
+        self.assertEqual(status, 200); self.assertIn(b'setting-row', body)
 
     def test_queued_job_can_be_cancelled_from_the_dashboard(self):
         job_id=self.add_provider_test('kimi')  # stays queued; never started

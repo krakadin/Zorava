@@ -340,9 +340,28 @@
     worker.addEventListener('change',()=>load().catch(e=>flash(e.message)));errors.addEventListener('change',()=>load().catch(e=>flash(e.message)));await load();
   }
   async function settingsPage() {
-    title('Settings','Read-only operational configuration. Secrets and provider credential values are never shown.');
+    title('Settings','Operational settings for the local workers. Secrets and provider credential values are never shown.');
     const data=await get('/api/v1/settings');const box=panel('WORKER SETTINGS');const dl=node('dl',undefined,'kv');
     addKV(dl,'Default worker mode','Coding in separate Git worktrees');addKV(dl,'Allowed project root',data.allowed_roots.join(', '),true);addKV(dl,'Qwen default timeout',`${data.qwen_timeout_seconds}s`);addKV(dl,'Kimi default timeout',`${data.kimi_timeout_seconds}s`);addKV(dl,'Maximum timeout',`${data.max_timeout_seconds}s`);addKV(dl,'Concurrency',`Qwen ${data.concurrency.qwen} · Kimi ${data.concurrency.kimi}`);addKV(dl,'Log/result retention',`${data.retention_days} days`);addKV(dl,'Dashboard bind',`${data.dashboard_bind}:${data.dashboard_port}`,true);addKV(dl,'Runtime state',data.runtime_state,true);box.append(dl);root.append(box);
+    const limits=data.concurrency_limits||{minimum:1,maximum:4};
+    const capacity=panel('WORKER CONCURRENCY');
+    capacity.append(node('p',`Each worker runs up to its slot capacity at once; extra jobs wait queued and start when a slot frees. Changes apply to future jobs only and are saved to the same private settings.json as the CLI.`,'notice'));
+    for(const worker of ['qwen','kimi']) {
+      const label=worker==='qwen'?'Qwen':'Kimi';
+      const row=node('div',undefined,'setting-row');
+      const field=node('label',`${label} concurrency`);
+      const select=document.createElement('select');select.id=`concurrency-${worker}`;select.name=`concurrency-${worker}`;
+      for(let value=limits.minimum;value<=limits.maximum;value++) {
+        const option=node('option',`${value} concurrent job${value===1?'':'s'}`);option.value=String(value);
+        if(value===data.concurrency[worker]) option.selected=true;
+        select.append(option);
+      }
+      field.append(select);row.append(field);
+      row.append(node('small',`Current: ${data.concurrency[worker]} · allowed ${limits.minimum}–${limits.maximum} · extra jobs queue`));
+      const save=node('button','Save','primary');save.dataset.action='save-concurrency';save.dataset.worker=worker;row.append(save);
+      capacity.append(row);
+    }
+    root.append(capacity);
     const cleanup=panel('RETENTION CLEANUP');cleanup.append(node('p','Expired Zorava job records, results, and event logs older than 30 days can be purged. Active jobs and retained Kimi isolated-edit worktrees are protected. Provider CLI histories are never touched.','notice'));
     const actions=node('div',undefined,'actions-bar');const preview=node('button','Preview expired records');preview.dataset.action='cleanup-preview';actions.append(preview);cleanup.append(actions);const output=node('div');output.id='cleanup-preview';cleanup.append(output);root.append(cleanup);
   }
@@ -378,6 +397,13 @@
         if(!window.confirm('Cancel this worker job?')) return;
         const result=await post(`/api/v1/jobs/${encodeURIComponent(button.dataset.id)}/cancel`);
         flash(`Cancellation requested for ${result.job_id}.`);setTimeout(()=>location.reload(),1000);
+      } else if(action==='save-concurrency'){
+        const worker=button.dataset.worker;
+        const select=document.querySelector(`#concurrency-${worker}`);
+        if(!select) throw new Error('Concurrency selector is not available on this page.');
+        const result=await post('/api/v1/settings/concurrency',{worker:worker,concurrency:Number.parseInt(select.value,10)});
+        flash(result.note || `Saved ${worker} concurrency.`);
+        await rerenderKeepingScroll(settingsPage);
       } else if(action==='cleanup-preview'){
         const result=await post('/api/v1/cleanup/preview');const target=document.querySelector('#cleanup-preview');target.replaceChildren();
         target.append(node('p',`${result.eligible_count} expired record(s) eligible; ${result.protected_count} protected.`));

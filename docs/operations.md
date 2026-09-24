@@ -34,7 +34,7 @@ ai-worker settings set qwen-concurrency 1-4   # simultaneous Qwen jobs (default:
 ai-worker settings set kimi-concurrency 1-4   # simultaneous Kimi jobs (default: 1)
 ```
 
-Each worker runs up to its configured slot capacity concurrently (cross-process flock slot locks under `~/.local/state/ai-workers/locks`). Jobs beyond capacity wait in `queued` state and start when a slot frees; cancelling a queued job marks it `cancelled` without ever starting a worker process. Capacity changes apply only to future jobs. The dashboard Settings and provider cards show capacity plus live queued/running counts.
+Each worker runs up to its configured slot capacity concurrently (cross-process flock slot locks under `~/.local/state/ai-workers/locks`). Jobs beyond capacity wait in `queued` state and start when a slot frees; cancelling a queued job marks it `cancelled` without ever starting a worker process. Capacity changes apply only to future jobs and can also be made from Dashboard → Settings → Worker concurrency (same 1–4 validation and private settings.json write). The dashboard Settings and provider cards show capacity plus live queued/running counts.
 
 The dashboard is loopback-only and has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It supports fixed small provider tests, cancellation, filtering history, a two-step retention purge, and an explicit read-only CLI version check. It accepts no arbitrary worker task and exposes no shell endpoint. Provider tests are live provider calls; page refreshes use cached/local state only. Start it with `ai-worker dashboard`; Ctrl+C stops the dashboard.
 
