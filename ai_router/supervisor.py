@@ -16,7 +16,7 @@ import uuid
 
 from .request import parse_request, WorkerRequest
 from .security import MAX_TEXT, redact
-from .settings import SettingsError, load_qwen_coding_budget
+from .settings import SettingsError, load_qwen_coding_budget, load_worker_concurrency
 from .state import StateStore
 from workers.base import WorkerSetupError
 
@@ -132,7 +132,12 @@ class Supervisor:
         job = self.state.get_job(job_id)
         if job is None:
             return False, 'NOT_FOUND'
-        if job['status'] != 'running':
+        if job['status'] == 'queued':
+            # The job is still waiting for a worker slot; no process exists.
+            if self.state.cancel_queued(job_id):
+                return True, 'CANCELLED'
+            job = self.state.get_job(job_id)  # raced into running; fall through
+        if job is None or job['status'] != 'running':
             return False, 'NOT_RUNNING'
         if not self.state.request_cancel(job_id):
             return False, 'NOT_RUNNING'
@@ -167,21 +172,22 @@ class Supervisor:
             except (ValueError, AttributeError, TypeError):
                 raise ValueError('Invalid preassigned job identifier.') from None
         self.state.create_job(job_id,request,adapter.requested_model,adapter.role,worker_version,job_type)
-        lock_path = self.runtime/'locks'/f'{request.worker}.lock'
-        lock_fd = os.open(lock_path,os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600)
-        lock_file = os.fdopen(lock_fd,'a+b')
         started_mono = time.monotonic()
         started_at = None
         proc = None
         launch_request = request
         stdout_data = bytearray()
         stderr_data = bytearray()
+        lock_file = None
         try:
             try:
-                fcntl.flock(lock_file.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)
-            except BlockingIOError:
-                self.state.fail_queued(job_id,'WORKER_BUSY','A job for this worker is already running.')
-                return self._failure(job_id,request,adapter,'failed','WORKER_BUSY','Worker is busy.',None,started_mono,None,worker_version)
+                capacity = load_worker_concurrency(self.runtime, request.worker)
+            except SettingsError as exc:
+                raise WorkerSetupError('CONFIG_ERROR', str(exc)) from None
+            lock_file = self._wait_for_slot(request.worker, capacity, job_id)
+            if lock_file is None:
+                # Cancelled while queued waiting for a worker slot.
+                return self._cancelled(job_id,request,adapter,started_mono,worker_version)
             prepare = getattr(adapter, 'prepare_request', None)
             if callable(prepare):
                 launch_request = prepare(request,job_id)
@@ -212,7 +218,14 @@ class Supervisor:
                 self._terminate(proc)
                 raise RuntimeError('Could not verify owned worker process.')
             started_at = self._now()
-            self.state.start_job(job_id,proc.pid,proc.pid,proc_start)
+            try:
+                self.state.start_job(job_id,proc.pid,proc.pid,proc_start)
+            except RuntimeError:
+                # A queued job cancelled after slot acquisition never starts.
+                self._terminate(proc)
+                if self.state.is_cancel_requested(job_id):
+                    return self._cancelled(job_id,request,adapter,started_mono,worker_version)
+                raise
             result = self._communicate(proc,payload,request.timeout_seconds,job_id,stdout_data,stderr_data)
             duration = int((time.monotonic()-started_mono)*1000)
             stdout = bytes(stdout_data)
@@ -301,7 +314,43 @@ class Supervisor:
                 except Exception:
                     try: self.state.event(job_id, 'warning', 'Temporary worker input cleanup failed.')
                     except sqlite3.Error: pass
-            lock_file.close()
+            if lock_file is not None:
+                lock_file.close()
+
+    def _wait_for_slot(self, worker: str, capacity: int, job_id: str):
+        """Acquire one of the worker's cross-process slot locks.
+
+        Each slot is a user-private flock file named ``<worker>.<index>.lock``.
+        Jobs beyond capacity stay queued here and start when a slot frees
+        instead of failing WORKER_BUSY. Returns the open locked file, or None
+        when the job was cancelled while queued (recorded by cancel_queued).
+        """
+        locks_dir = self.runtime/'locks'
+        fds = []
+        try:
+            for index in range(max(1, capacity)):
+                fds.append(os.open(locks_dir/f'{worker}.{index}.lock',
+                                   os.O_CREAT|os.O_RDWR|os.O_CLOEXEC|os.O_NOFOLLOW,0o600))
+            while True:
+                for fd in fds:
+                    try:
+                        fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        continue
+                    fds.remove(fd)
+                    return os.fdopen(fd,'a+b')
+                if self.state.is_cancel_requested(job_id):
+                    return None
+                time.sleep(POLL_SECONDS)
+        finally:
+            for fd in fds:
+                try: os.close(fd)
+                except OSError: pass
+
+    def _cancelled(self,job_id,request,adapter,started_mono,worker_version='unknown'):
+        return RunResult(job_id,request.worker,adapter.requested_model,worker_version,'cancelled',None,
+            self._now(),int((time.monotonic()-started_mono)*1000),None,None,None,
+            {'code':'CANCELLED','message':'Cancelled by user.'})
 
     def _communicate(self,proc,payload,timeout,job_id,stdout_data,stderr_data):
         selector=selectors.DefaultSelector()

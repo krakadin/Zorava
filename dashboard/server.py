@@ -23,6 +23,7 @@ sys.path.insert(0, str(PROJECT))
 
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
+from ai_router.settings import SETTINGS_FIELDS, SettingsError, load_worker_concurrency
 from ai_router.security import redact
 from ai_router.state import StateStore
 from ai_router.supervisor import Supervisor
@@ -96,12 +97,19 @@ class DashboardController:
                            'routing': 'OVERRIDE_PRESENT' if base_override or settings_override else 'DIRECT'},
                 'qwen': qwen, 'kimi': kimi}
 
+    def _worker_concurrency(self, name: str) -> int:
+        try:
+            return load_worker_concurrency(self.runtime, name)
+        except SettingsError:
+            return SETTINGS_FIELDS[f'{name}_concurrency']['default']
+
     def providers(self):
         if self.provider_snapshot is None:
             self.provider_snapshot = self._load_provider_snapshot()
         with self._lock:
             starting_workers = {worker for worker, _proc in self._test_processes.values()}
         now = datetime.now(timezone.utc)
+        activity = self.store.worker_activity()
         values = {}
         for name in ('qwen', 'kimi'):
             info = dict(self.provider_snapshot[name])
@@ -129,6 +137,9 @@ class DashboardController:
                          'last_test_status': last.get('status') if last else None,
                          'last_test_error': last.get('error_code') if last else None,
                          'last_success_at': self.store.last_successful_test(name),
+                         'concurrency': self._worker_concurrency(name),
+                         'queued_jobs': activity.get(name, {}).get('queued', 0),
+                         'running_jobs': activity.get(name, {}).get('running', 0),
                          'role': 'Coder', 'default_mode': 'isolated-edit'})
             info.update(self.updates.status(name, info.get('version')).as_dict())
             values[name] = info
@@ -157,21 +168,35 @@ class DashboardController:
                 'note': 'Read-only version metadata; nothing is downloaded or installed.',
                 'updates': self.updates.snapshot(self._installed_versions())}
 
+    def _slot_lock_paths(self, worker: str) -> list[Path]:
+        """Every slot lock a supervisor could currently hold for this worker."""
+        locks_dir = self.runtime / 'locks'
+        paths = {locks_dir / f'{worker}.{index}.lock'
+                 for index in range(max(1, self._worker_concurrency(worker)))}
+        try:
+            paths.update(locks_dir.glob(f'{worker}.*.lock'))
+        except OSError:
+            pass
+        return sorted(paths)
+
     def _worker_has_active_job(self, worker: str) -> bool:
         if not self.store.active_jobs(worker):
             return False
-        lock_path = self.runtime / 'locks' / f'{worker}.lock'
+        # A child can exit while its supervisor is still saving the result.
+        # Only recover rows while holding every slot lock for that worker.
+        held = []
         try:
-            fd = os.open(lock_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
-        except FileNotFoundError:
-            return True
-        with os.fdopen(fd, 'rb') as lock:
-            try:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return True
-            # A child can exit while its supervisor is still saving the result.
-            # Only recover rows while holding that supervisor's worker lock.
+            for path in self._slot_lock_paths(worker):
+                try:
+                    fd = os.open(path, os.O_CREAT | os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
+                except FileNotFoundError:
+                    return True
+                try:
+                    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    os.close(fd)
+                    return True
+                held.append(fd)
             for job in self.store.active_jobs(worker):
                 pgid = job.get('process_group')
                 if job['status'] == 'queued' or not isinstance(pgid, int) or pgid <= 0:
@@ -179,6 +204,9 @@ class DashboardController:
                 if Supervisor._group_exists(pgid):
                     return True
                 self.store.mark_interrupted(job['id'])
+        finally:
+            for fd in held:
+                os.close(fd)
         return False
 
     def start_test(self, worker: str) -> str:
@@ -230,8 +258,8 @@ class DashboardController:
         job = self.store.get_job(canonical)
         if job is None:
             raise LookupError('Job not found.')
-        if job.get('status') != 'running':
-            raise RuntimeError('Only running jobs can be cancelled.')
+        if job.get('status') not in ('running', 'queued'):
+            raise RuntimeError('Only running or queued jobs can be cancelled.')
         command = [sys.executable, '-B', str(WORKER_SCRIPT), 'cancel', canonical, '--json']
         proc = subprocess.run(command, cwd=PROJECT, env=common_child_environment(),
                               stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -421,7 +449,10 @@ def make_handler(controller: DashboardController):
                     return
                 if path == '/api/v1/settings':
                     self._json({'allowed_roots':['/home/krakadin/myDev'],'qwen_timeout_seconds':DEFAULT_TIMEOUT['qwen'],'kimi_timeout_seconds':DEFAULT_TIMEOUT['kimi'],
-                                'max_timeout_seconds':MAX_TIMEOUT,'concurrency':{'qwen':1,'kimi':1},'default_mode':'isolated-edit','retention_days':DEFAULT_RETENTION_DAYS,
+                                'max_timeout_seconds':MAX_TIMEOUT,
+                                'concurrency':{'qwen':controller._worker_concurrency('qwen'),'kimi':controller._worker_concurrency('kimi')},
+                                'concurrency_limits':{'minimum':1,'maximum':SETTINGS_FIELDS['qwen_concurrency']['maximum']},
+                                'default_mode':'isolated-edit','retention_days':DEFAULT_RETENTION_DAYS,
                                 'dashboard_bind':'127.0.0.1','dashboard_port':controller.port,
                                 'runtime_state':str(controller.runtime),'model_changes':'Use only locally verified provider model profiles; this dashboard does not edit provider URLs or credentials.'})
                     return
@@ -485,7 +516,8 @@ def make_handler(controller: DashboardController):
                     except ValueError: return self._error(400,'INVALID_JOB_ID','Job ID must be a UUID.')
                     job = controller.store.get_job(job_id)
                     if not job: return self._error(404,'NOT_FOUND','Job was not found.')
-                    if job.get('status') != 'running': return self._error(409,'JOB_NOT_RUNNING','Only running jobs can be cancelled.')
+                    if job.get('status') not in ('running', 'queued'):
+                        return self._error(409,'JOB_NOT_RUNNING','Only running or queued jobs can be cancelled.')
                     thread = threading.Thread(target=self._cancel_safely,args=(job_id,),daemon=True)
                     thread.start()
                     self._json({'job_id':job_id,'status':'cancellation_requested'},202); return

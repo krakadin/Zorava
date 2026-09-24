@@ -18,8 +18,9 @@ sys.path.insert(0, str(PROJECT))
 
 from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT, RequestError
 from ai_router.landlock import LandlockUnavailable, landlock_abi
-from ai_router.settings import (MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS, SettingsError,
-                                load_settings, parse_budget_token, save_settings)
+from ai_router.settings import (MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS,
+                                SettingsError, load_settings, load_worker_concurrency,
+                                parse_budget_token, parse_concurrency_token, save_settings)
 from ai_router.state import StateStore
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.supervisor import Supervisor
@@ -195,13 +196,21 @@ def command_status(args) -> int:
     worker_names = ('qwen', 'kimi')
     last_tests = {name: None for name in worker_names}
     last_successes = {name: None for name in worker_names}
+    activity = {}
     try:
         store = StateStore(RUNTIME / 'workers.db')
         for name in worker_names:
             tests = store.provider_tests(name, limit=1)
             last_tests[name] = tests[0] if tests else None
             last_successes[name] = store.last_successful_test(name)
+        activity = store.worker_activity()
     except (OSError, RuntimeError, sqlite3.Error):
+        pass
+    capacities = {name: None for name in worker_names}
+    try:
+        for name in worker_names:
+            capacities[name] = load_worker_concurrency(RUNTIME, name)
+    except SettingsError:
         pass
     provider_status = {}
     for name, last_test in last_tests.items():
@@ -244,6 +253,9 @@ def command_status(args) -> int:
             'provider': qwen_info['provider'],
             'endpoint_host': qwen_info['endpoint_host'],
             'authentication': 'Qwen-owned credential present' if qwen_info['credential_present'] else 'Qwen credential missing',
+            'concurrency': capacities['qwen'],
+            'queued_jobs': activity.get('qwen', {}).get('queued', 0),
+            'running_jobs': activity.get('qwen', {}).get('running', 0),
             **test_fields('qwen'),
         },
         'kimi': {
@@ -252,6 +264,9 @@ def command_status(args) -> int:
             'requested_model': 'kimi-code/k3',
             'provider': 'Kimi Code',
             'authentication': 'Kimi Code-managed OAuth; credential not inspected',
+            'concurrency': capacities['kimi'],
+            'queued_jobs': activity.get('kimi', {}).get('queued', 0),
+            'running_jobs': activity.get('kimi', {}).get('running', 0),
             **test_fields('kimi'),
         },
         'dashboard': {'available': True, 'default_url': 'http://127.0.0.1:8787/',
@@ -268,6 +283,8 @@ def command_status(args) -> int:
         if provider == 'claude':
             print(f"  Routing: {info['routing']}")
         else:
+            print(f"  Concurrency: {info.get('concurrency') or 'unknown'} slot(s) "
+                  f"(running {info.get('running_jobs', 0)}, queued {info.get('queued_jobs', 0)})")
             print(f"  Last live test: {info['last_test_at'] or 'not performed'}")
             if info.get('last_test_id'):
                 print(f"  Last test job: {info['last_test_id']} ({info.get('last_test_status') or 'unknown'})")
@@ -434,7 +451,10 @@ def _settings_view(settings: dict) -> dict:
     budget = settings['qwen_coding_max_tool_calls']
     return {'qwen_coding_max_tool_calls': budget,
             'qwen_coding_budget': 'unlimited' if budget == UNLIMITED_TOOL_CALLS else budget,
-            'applies_to': 'qwen isolated-edit jobs without an explicit max_tool_calls'}
+            'applies_to': 'qwen isolated-edit jobs without an explicit max_tool_calls',
+            'qwen_concurrency': settings['qwen_concurrency'],
+            'kimi_concurrency': settings['kimi_concurrency'],
+            'concurrency_note': 'Jobs beyond capacity wait queued and start when a slot frees.'}
 
 
 def command_settings_show(args) -> int:
@@ -448,17 +468,20 @@ def command_settings_show(args) -> int:
 
 def command_settings_set(args) -> int:
     try:
-        budget = parse_budget_token(args.value)
+        if args.key == 'qwen-coding-budget':
+            overrides = {'qwen_coding_max_tool_calls': parse_budget_token(args.value)}
+        else:
+            overrides = {args.key.replace('-', '_'): parse_concurrency_token(args.value)}
     except SettingsError as exc:
         value = error_result('INVALID_REQUEST', str(exc)[:240])
         return emit_json(value, 2) if args.json else print_human(value, 2)
     try:
-        saved = save_settings(RUNTIME, qwen_coding_max_tool_calls=budget)
+        saved = save_settings(RUNTIME, **overrides)
     except SettingsError as exc:
         value = error_result(exc.code, str(exc)[:240])
         return emit_json(value, 3) if args.json else print_human(value, 3)
     value = {'schema_version': 1, 'status': 'saved', 'settings': _settings_view(saved),
-             'note': 'Applies to future Qwen coding jobs only; running jobs are unchanged.'}
+             'note': 'Applies to future jobs only; running or queued jobs are unchanged.'}
     return emit_json(value) if args.json else print_human({'result': json.dumps(value['settings'], ensure_ascii=False)})
 
 
@@ -520,12 +543,13 @@ def make_parser() -> argparse.ArgumentParser:
     dashboard.set_defaults(func=command_dashboard)
     settings_cmd = commands.add_parser('settings', help='Show or set saved local defaults (no credentials).')
     settings_sub = settings_cmd.add_subparsers(dest='settings_command', required=True)
-    settings_show = settings_sub.add_parser('show', help='Show the saved Qwen coding tool-call budget.')
+    settings_show = settings_sub.add_parser('show', help='Show the saved budget and concurrency defaults.')
     settings_show.add_argument('--json', action='store_true')
     settings_show.set_defaults(func=command_settings_show)
-    settings_set = settings_sub.add_parser('set', help='Save the default Qwen coding tool-call budget.')
-    settings_set.add_argument('key', choices=('qwen-coding-budget',))
-    settings_set.add_argument('value', help=f"'unlimited' or an integer 0-{MAX_TOOL_CALLS_LIMIT}.")
+    settings_set = settings_sub.add_parser('set', help='Save a local default (budget or worker concurrency).')
+    settings_set.add_argument('key', choices=('qwen-coding-budget', 'qwen-concurrency', 'kimi-concurrency'))
+    settings_set.add_argument('value', help="qwen-coding-budget: 'unlimited' or 0-%d; "
+                              "qwen-concurrency/kimi-concurrency: 1-%d." % (MAX_TOOL_CALLS_LIMIT, MAX_CONCURRENCY))
     settings_set.add_argument('--json', action='store_true')
     settings_set.set_defaults(func=command_settings_set)
     return parser

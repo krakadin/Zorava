@@ -20,6 +20,20 @@ elif mode == 'crash':
     raise SystemExit(17)
 elif mode == 'sleep':
     time.sleep(60)
+elif mode == 'gate':
+    # Waits for the test-created gate file, then succeeds. Lets tests hold a
+    # worker slot deterministically and release it on demand.
+    gate = Path(os.environ['AI_TEST_GATE'])
+    deadline = time.monotonic() + 30
+    while not gate.exists():
+        if time.monotonic() > deadline:
+            raise SystemExit(4)
+        time.sleep(0.02)
+    print(json.dumps({'text':'fake worker completed','reported_model':'fake-v1'}))
+elif mode == 'echo':
+    # Echoes this job's own task so tests can verify per-job isolation.
+    print(json.dumps({'text':f"job {payload['job_id']} task {payload['task']}",
+                      'reported_model':'fake-v1'}))
 elif mode == 'huge':
     sys.stdout.write('x'*200000)
 elif mode == 'secret':

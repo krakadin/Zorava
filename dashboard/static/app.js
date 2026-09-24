@@ -148,7 +148,7 @@
     const when=node('td',displayTime(job.created_at)); tr.append(when);
     const action=node('td');
     const view=node('a','View','button'); view.href=`/?page=jobs&id=${encodeURIComponent(job.id)}`; action.append(view);
-    if (includeActions && job.status === 'running') {
+    if (includeActions && (job.status === 'running' || job.status === 'queued')) {
       const cancel=node('button','Cancel','danger'); cancel.dataset.action='cancel'; cancel.dataset.id=job.id; action.append(cancel);
     }
     tr.append(action); return tr;
@@ -165,6 +165,10 @@
     const dl=node('dl',undefined,'kv');
     addKV(dl,'Model',info.requested_model,true); addKV(dl,'Provider',info.provider);
     if (info.role) addKV(dl,'Role',`${info.role} · separate worktree`);
+    if (info.concurrency != null) {
+      addKV(dl,'Capacity',`${info.concurrency} concurrent job${info.concurrency===1?'':'s'}`);
+      addKV(dl,'Active jobs',`running ${info.running_jobs ?? 0} · queued ${info.queued_jobs ?? 0}`);
+    }
     addKV(dl,'Authentication',info.authentication); addKV(dl,'Routing',info.routing || 'Worker CLI direct');
     if (info.endpoint_url) addKV(dl,'Base URL',info.endpoint_url,true);
     else if (info.endpoint_host) addKV(dl,'Endpoint host',info.endpoint_host,true);
@@ -301,7 +305,7 @@
     const data=await get('/api/v1/jobs/'+encodeURIComponent(jobId));const job=data.job;
     const summary=panel('SUMMARY'); const dl=node('dl',undefined,'kv');
     [['Job ID',job.id],['Parent/orchestrator','Claude'],['Worker',job.role+' ('+job.worker+')'],['Requested model',job.requested_model],['Reported model',job.reported_model||'Not provided'],['CLI version',job.worker_version],['Project',job.cwd],['Mode',job.mode],['Status',job.status],['Created',displayTime(job.created_at)],['Started',displayTime(job.started_at)],['Completed',displayTime(job.completed_at)],['Duration',duration(job.duration_ms)],['Exit code',job.exit_code],['Usage',job.usage?JSON.stringify(job.usage):'Not reported by worker']].forEach(([a,b])=>addKV(dl,a,b,true));
-    summary.append(dl); if(job.status==='running'){const button=node('button','Cancel job','danger');button.dataset.action='cancel';button.dataset.id=job.id;summary.append(button)}root.append(summary);
+    summary.append(dl); if(job.status==='running'||job.status==='queued'){const button=node('button','Cancel job','danger');button.dataset.action='cancel';button.dataset.id=job.id;summary.append(button)}root.append(summary);
     const task=panel('TASK SUMMARY');task.append(node('pre',job.task_summary||'(Provider test)', 'prose'));root.append(task);
     if(job.result){const output=panel('WORKER OUTPUT');output.append(node('pre',job.result,'prose'));root.append(output)}
     if(job.partial_result){const output=panel('PARTIAL RESULT');output.append(node('pre',job.partial_result,'prose'));root.append(output)}

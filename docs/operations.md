@@ -27,9 +27,14 @@ printf '%s' 'Implement the requested change in this clean Git checkout; do not r
 ai-worker jobs
 ai-worker show JOB_UUID
 ai-worker diff JOB_UUID --json
-ai-worker cancel JOB_UUID
+ai-worker cancel JOB_UUID            # works for running jobs and queued jobs waiting for a slot
 ai-worker discard JOB_UUID --confirm  # permanently removes this job's isolated worktree/history
+ai-worker settings show                       # saved budget and per-worker slot capacity
+ai-worker settings set qwen-concurrency 1-4   # simultaneous Qwen jobs (default: 2)
+ai-worker settings set kimi-concurrency 1-4   # simultaneous Kimi jobs (default: 1)
 ```
+
+Each worker runs up to its configured slot capacity concurrently (cross-process flock slot locks under `~/.local/state/ai-workers/locks`). Jobs beyond capacity wait in `queued` state and start when a slot frees; cancelling a queued job marks it `cancelled` without ever starting a worker process. Capacity changes apply only to future jobs. The dashboard Settings and provider cards show capacity plus live queued/running counts.
 
 The dashboard is loopback-only and has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It supports fixed small provider tests, cancellation, filtering history, a two-step retention purge, and an explicit read-only CLI version check. It accepts no arbitrary worker task and exposes no shell endpoint. Provider tests are live provider calls; page refreshes use cached/local state only. Start it with `ai-worker dashboard`; Ctrl+C stops the dashboard.
 
@@ -52,7 +57,7 @@ CLI version reporting is separate from provider health. `installed_version` come
 - `AUTH_ERROR`: the worker's provider rejected authentication. Use the official CLI/provider authentication flow; ai-router never captures login credentials.
 - `RATE_LIMITED` / `QUOTA_OR_BILLING`: provider reported a limit; do not repeatedly retry.
 - `TIMEOUT`: worker exceeded its requested limit; owned process group is terminated.
-- `WORKER_BUSY`: another job for the same worker is active.
+- `WORKER_BUSY`: legacy; jobs beyond the configured per-worker capacity now wait `queued` and start when a slot frees instead of failing.
 - `INVALID_OUTPUT`: the CLI output did not match its expected JSON shape; rerun `preflight WORKER` and inspect the job's sanitized details.
 - `PATH_NOT_ALLOWED`: working directory is outside configured roots.
 - `PROJECT_DIRTY`: isolated editing requires a clean primary checkout; commit or otherwise preserve your changes yourself, then retry.

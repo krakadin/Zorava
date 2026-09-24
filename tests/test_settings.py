@@ -13,10 +13,12 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ai_router.settings import (DEFAULT_QWEN_CODING_BUDGET, MAX_TOOL_CALLS_LIMIT,
+from ai_router.settings import (DEFAULT_KIMI_CONCURRENCY, DEFAULT_QWEN_CODING_BUDGET,
+                                DEFAULT_QWEN_CONCURRENCY, MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT,
                                 SETTINGS_FIELDS, UNLIMITED_TOOL_CALLS, SettingsError,
-                                load_qwen_coding_budget, load_settings, parse_budget_token,
-                                save_settings, settings_path, validate_budget)
+                                load_qwen_coding_budget, load_settings, load_worker_concurrency,
+                                parse_budget_token, parse_concurrency_token,
+                                save_settings, settings_path, validate_budget, validate_concurrency)
 from ai_router.supervisor import Supervisor
 from workers.base import ParsedOutput, common_child_environment
 
@@ -47,8 +49,61 @@ class SettingsModuleTests(unittest.TestCase):
     def test_missing_file_yields_unlimited_default(self):
         self.assertEqual(DEFAULT_QWEN_CODING_BUDGET, UNLIMITED_TOOL_CALLS)
         self.assertEqual(load_settings(self.runtime),
-                         {'qwen_coding_max_tool_calls': UNLIMITED_TOOL_CALLS})
+                         {'qwen_coding_max_tool_calls': UNLIMITED_TOOL_CALLS,
+                          'qwen_concurrency': DEFAULT_QWEN_CONCURRENCY,
+                          'kimi_concurrency': DEFAULT_KIMI_CONCURRENCY})
         self.assertEqual(load_qwen_coding_budget(self.runtime), UNLIMITED_TOOL_CALLS)
+
+    def test_default_concurrency_is_two_for_qwen_and_one_for_kimi(self):
+        self.assertEqual(DEFAULT_QWEN_CONCURRENCY, 2)
+        self.assertEqual(DEFAULT_KIMI_CONCURRENCY, 1)
+        self.assertEqual(load_worker_concurrency(self.runtime, 'qwen'), 2)
+        self.assertEqual(load_worker_concurrency(self.runtime, 'kimi'), 1)
+        with self.assertRaises(SettingsError):
+            load_worker_concurrency(self.runtime, 'other')
+
+    def test_validate_and_parse_concurrency_are_strictly_bounded(self):
+        for value in (True, False, '2', 1.5, 0, -1, MAX_CONCURRENCY + 1, None):
+            with self.subTest(value=value), self.assertRaises(SettingsError):
+                validate_concurrency(value)
+        for value in (1, 2, MAX_CONCURRENCY):
+            self.assertEqual(validate_concurrency(value), value)
+        self.assertEqual(parse_concurrency_token(' 2 '), 2)
+        for token in ('', 'abc', 'unlimited', '0', str(MAX_CONCURRENCY + 1), '-1', '1.5', '0x2'):
+            with self.subTest(token=token), self.assertRaises(SettingsError) as caught:
+                parse_concurrency_token(token)
+            self.assertEqual(caught.exception.code, 'INVALID_REQUEST')
+
+    def test_schema_one_file_without_concurrency_migrates_to_defaults(self):
+        # Migration compatibility: a settings.json saved before the
+        # concurrency fields existed keeps its budget and gains defaults.
+        self.write_raw(json.dumps({'schema_version': 1, 'qwen_coding_max_tool_calls': 50}).encode())
+        settings = load_settings(self.runtime)
+        self.assertEqual(settings['qwen_coding_max_tool_calls'], 50)
+        self.assertEqual(settings['qwen_concurrency'], 2)
+        self.assertEqual(settings['kimi_concurrency'], 1)
+
+    def test_save_preserves_unspecified_fields(self):
+        save_settings(self.runtime, qwen_coding_max_tool_calls=75)
+        saved = save_settings(self.runtime, qwen_concurrency=3)
+        self.assertEqual(saved['qwen_coding_max_tool_calls'], 75)
+        self.assertEqual(saved['qwen_concurrency'], 3)
+        self.assertEqual(saved['kimi_concurrency'], 1)
+        saved = save_settings(self.runtime, kimi_concurrency=2)
+        self.assertEqual(saved['qwen_coding_max_tool_calls'], 75)
+        self.assertEqual(saved['qwen_concurrency'], 3)
+        self.assertEqual(saved['kimi_concurrency'], 2)
+        path = settings_path(self.runtime)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+        for leftover in self.runtime.iterdir():
+            self.assertEqual(leftover.name, 'settings.json')
+
+    def test_invalid_saved_concurrency_is_rejected(self):
+        for bad in (0, MAX_CONCURRENCY + 1, True, '2'):
+            with self.subTest(bad=bad):
+                self.write_raw(json.dumps({'schema_version': 1, 'qwen_concurrency': bad}).encode())
+                with self.assertRaises(SettingsError):
+                    load_settings(self.runtime)
 
     def test_field_schema_is_introspectable(self):
         field = SETTINGS_FIELDS['qwen_coding_max_tool_calls']
@@ -254,6 +309,39 @@ class SettingsCliTests(unittest.TestCase):
         self.assertEqual(path.read_bytes(), b'junk')
         code, value = self.invoke(self.worker.command_settings_show)
         self.assertEqual(code, 3)
+
+    def test_concurrency_set_show_and_preservation(self):
+        code, value = self.invoke(self.worker.command_settings_show)
+        self.assertEqual(code, 0)
+        self.assertEqual(value['settings']['qwen_concurrency'], 2)
+        self.assertEqual(value['settings']['kimi_concurrency'], 1)
+        code, value = self.invoke(self.worker.command_settings_set,
+                                  key='qwen-concurrency', value='3')
+        self.assertEqual(code, 0)
+        self.assertEqual(value['settings']['qwen_concurrency'], 3)
+        self.assertEqual(value['settings']['kimi_concurrency'], 1)
+        code, value = self.invoke(self.worker.command_settings_set,
+                                  key='qwen-coding-budget', value='90')
+        self.assertEqual(code, 0)
+        # Setting one key never disturbs another saved key.
+        self.assertEqual(value['settings']['qwen_concurrency'], 3)
+        self.assertEqual(value['settings']['qwen_coding_max_tool_calls'], 90)
+        code, value = self.invoke(self.worker.command_settings_set,
+                                  key='kimi-concurrency', value='2')
+        self.assertEqual(code, 0)
+        self.assertEqual(value['settings']['kimi_concurrency'], 2)
+        code, value = self.invoke(self.worker.command_settings_show)
+        self.assertEqual((value['settings']['qwen_concurrency'], value['settings']['kimi_concurrency']), (3, 2))
+
+    def test_concurrency_set_rejects_invalid_values_without_writing(self):
+        for key in ('qwen-concurrency', 'kimi-concurrency'):
+            for token in ('0', '5', 'abc', 'unlimited', '-1', '1.5'):
+                with self.subTest(key=key, token=token):
+                    code, value = self.invoke(self.worker.command_settings_set,
+                                              key=key, value=token)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(value['error']['code'], 'INVALID_REQUEST')
+        self.assertFalse(settings_path(self.runtime).exists())
 
     def test_delegate_parses_max_tool_calls_flag(self):
         parser = self.worker.make_parser()

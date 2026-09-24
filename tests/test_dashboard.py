@@ -15,6 +15,7 @@ from http.server import ThreadingHTTPServer
 
 from ai_router import updates
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
+from ai_router.settings import save_settings
 from ai_router.state import StateStore
 from dashboard.server import DashboardController, make_handler, serve
 
@@ -37,8 +38,8 @@ class DashboardTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.runtime=Path(self.temp.name)/'state';self.runtime.mkdir(mode=0o700);os.chmod(self.runtime,0o700)
         (self.runtime/'locks').mkdir(mode=0o700)
-        for worker in ('qwen','kimi'):
-            (self.runtime/'locks'/f'{worker}.lock').touch(mode=0o600)
+        for slot in ('qwen.0','qwen.1','kimi.0'):
+            (self.runtime/'locks'/f'{slot}.lock').touch(mode=0o600)
         safe={'claude':{'worker':'claude','status':'CONFIGURED','requested_model':'claude-local',
                         'provider':'Anthropic','endpoint_host':'api.anthropic.com','authentication':'OAuth','routing':'DIRECT'},
               'qwen':{'worker':'qwen','status':'CONFIGURED','requested_model':'qwen-test','provider':'Token Plan',
@@ -132,6 +133,46 @@ class DashboardTests(unittest.TestCase):
                           settings['max_timeout_seconds']),(1800,1800,1800))
         status,_,body=self.request('GET','/api/v1/permissions')
         self.assertEqual(status,200);self.assertIn('same user',json.loads(body)['os_sandbox'])
+
+    def test_settings_and_status_expose_capacity_and_queue_counts(self):
+        status,_,body=self.request('GET','/api/v1/settings')
+        self.assertEqual(status,200);settings=json.loads(body)
+        # Defaults: Qwen runs two concurrent sessions; Kimi stays serialized.
+        self.assertEqual(settings['concurrency'],{'qwen':2,'kimi':1})
+        self.assertEqual(settings['concurrency_limits'],{'minimum':1,'maximum':4})
+        self.assertEqual(settings['retention_days'],30)
+        # Existing fields are unchanged.
+        self.assertEqual(settings['max_timeout_seconds'],MAX_TIMEOUT)
+        save_settings(self.runtime,kimi_concurrency=2)
+        status,_,body=self.request('GET','/api/v1/settings')
+        self.assertEqual(json.loads(body)['concurrency'],{'qwen':2,'kimi':2})
+        # Status/provider payloads add capacity plus live queued/running counts.
+        queued_id=self.add_provider_test('qwen')
+        running_id=self.add_provider_test('qwen')
+        self.store.start_job(running_id,123,123,'fixture')
+        for endpoint in ('/api/v1/providers','/api/v1/status'):
+            status,_,body=self.request('GET',endpoint)
+            self.assertEqual(status,200)
+            qwen=json.loads(body)['providers']['qwen']
+            self.assertEqual(qwen['concurrency'],2)
+            self.assertEqual(qwen['queued_jobs'],1)
+            self.assertEqual(qwen['running_jobs'],1)
+            self.assertEqual(qwen['requested_model'],'qwen-test')  # existing fields intact
+            kimi=json.loads(body)['providers']['kimi']
+            self.assertEqual(kimi['concurrency'],2)
+            self.assertEqual(kimi['queued_jobs'],0)
+            self.assertEqual(kimi['running_jobs'],0)
+        self.assertIsNotNone(queued_id)
+
+    def test_queued_job_can_be_cancelled_from_the_dashboard(self):
+        job_id=self.add_provider_test('kimi')  # stays queued; never started
+        called=threading.Event()
+        def cancel(value): called.set();return {'job_id':value,'status':'cancelled'}
+        self.controller.cancel_job=cancel
+        status,_,body=self.request('POST',f'/api/v1/jobs/{job_id}/cancel',body='{}',headers=self.csrf_headers())
+        self.assertEqual(status,202,body)
+        self.assertTrue(called.wait(2))
+        self.assertEqual(json.loads(body)['status'],'cancellation_requested')
 
     def test_open_tab_can_refresh_its_action_token_after_restart(self):
         old_headers=self.csrf_headers()
@@ -287,7 +328,7 @@ class DashboardTests(unittest.TestCase):
     def test_test_does_not_recover_job_while_supervisor_still_holds_lock(self):
         job_id=self.add_provider_test('kimi')
         self.store.start_job(job_id,123,123,'fixture')
-        with (self.runtime/'locks/kimi.lock').open('rb') as lock, \
+        with (self.runtime/'locks/kimi.0.lock').open('rb') as lock, \
              patch('dashboard.server.Supervisor._group_exists',return_value=False), \
              patch('dashboard.server.subprocess.Popen') as launch:
             fcntl.flock(lock.fileno(),fcntl.LOCK_EX|fcntl.LOCK_NB)

@@ -257,6 +257,22 @@ class StateStore:
             db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         return deleted
 
+    def cancel_queued(self, job_id):
+        """Cancel a job still waiting for a worker slot.
+
+        The status-scoped update is atomic: a job that has already entered
+        running state is left for the running-process cancellation path.
+        """
+        now = utc_now()
+        with self.connect() as db:
+            cur = db.execute("""UPDATE jobs SET status='cancelled',completed_at=?,cancel_requested=1,
+                error_code='CANCELLED',error_message='Cancelled by user.'
+                WHERE id=? AND status='queued'""", (now, job_id))
+            if cur.rowcount:
+                db.execute('INSERT INTO job_events(job_id,timestamp,event,detail) VALUES (?,?,?,?)',
+                           (job_id, now, 'cancelled', 'cancelled while queued'))
+            return cur.rowcount == 1
+
     def request_cancel(self, job_id):
         with self.connect() as db:
             cur = db.execute("UPDATE jobs SET cancel_requested=1 WHERE id=? AND status='running'", (job_id,))
@@ -264,6 +280,17 @@ class StateStore:
                 db.execute('INSERT INTO job_events(job_id,timestamp,event,detail) VALUES (?,?,?,?)',
                            (job_id, utc_now(), 'cancellation requested', ''))
             return cur.rowcount == 1
+
+    def worker_activity(self):
+        """Per-worker queued/running job counts for status reporting."""
+        counts = {}
+        with self.connect() as db:
+            rows = db.execute("SELECT worker,status,COUNT(*) AS count FROM jobs "
+                              "WHERE status IN ('queued','running') GROUP BY worker,status").fetchall()
+        for row in rows:
+            entry = counts.setdefault(row['worker'], {'queued': 0, 'running': 0})
+            entry[row['status']] = row['count']
+        return counts
 
     def is_cancel_requested(self, job_id):
         with self.connect() as db:

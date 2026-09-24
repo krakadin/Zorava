@@ -251,14 +251,46 @@ class StateAndProcessTests(SupervisorFixture):
         result=small.run(self.request(),FakeAdapter('huge'))
         self.assertEqual(result.error['code'],'OUTPUT_LIMIT')
 
-    def test_same_backend_concurrency_returns_worker_busy(self):
-        lock=self.runtime/'locks/qwen.lock'
-        fd=os.open(lock,os.O_CREAT|os.O_RDWR,0o600)
+    def test_job_waits_queued_when_all_worker_slots_are_held(self):
+        # Qwen's default capacity is two cross-process slots; holding both
+        # leaves a new job queued instead of failing WORKER_BUSY.
+        fds=[]
+        for index in range(2):
+            fd=os.open(self.runtime/'locks'/f'qwen.{index}.lock',os.O_CREAT|os.O_RDWR,0o600)
+            fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+            fds.append(fd)
+        try:
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                future=pool.submit(self.run_mode)
+                deadline=time.monotonic()+4
+                job=None
+                while time.monotonic()<deadline:
+                    rows=self.supervisor.state.jobs()
+                    queued=next((row for row in rows if row['status']=='queued'),None)
+                    if queued:
+                        job=queued
+                        break
+                    time.sleep(0.05)
+                self.assertIsNotNone(job,'job did not stay queued while slots were held')
+                accepted,code=self.supervisor.cancel(job['id'])
+                self.assertTrue(accepted)
+                self.assertEqual(code,'CANCELLED')
+                result=future.result(timeout=5)
+            self.assertEqual(result.status,'cancelled')
+            self.assertEqual(result.error['code'],'CANCELLED')
+            persisted=self.supervisor.state.get_job(result.job_id)
+            self.assertEqual(persisted['status'],'cancelled')
+            self.assertIsNone(persisted['started_at'])
+        finally:
+            for fd in fds:
+                os.close(fd)
+
+    def test_one_held_slot_does_not_block_a_second_qwen_job(self):
+        fd=os.open(self.runtime/'locks'/'qwen.0.lock',os.O_CREAT|os.O_RDWR,0o600)
         fcntl.flock(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
         try:
             result=self.run_mode()
-            self.assertEqual(result.error['code'],'WORKER_BUSY')
-            self.assertEqual(result.status,'failed')
+            self.assertEqual(result.status,'completed')
         finally:
             os.close(fd)
 

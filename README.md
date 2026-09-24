@@ -60,6 +60,18 @@ ai-worker settings set qwen-coding-budget 100          # or any integer 0-100000
 
 The preset is stored as user-private (0600) JSON under `~/.local/state/ai-workers/settings.json` with no credentials, and applies only to future Qwen coding jobs. Read-only analysis keeps its fixed small budget (24) unless a request overrides it, and smoke tests keep their fixed zero-tool policy. If a bounded budget is exhausted (Qwen exit 55), the job fails with `BUDGET_EXHAUSTED`; the saved worktree diff is retained and can be continued by a new job. Kimi does not support `max_tool_calls`.
 
+### Worker concurrency
+
+Each worker has a bounded number of cross-process slots, enforced with user-private flock files under `~/.local/state/ai-workers/locks`. Qwen supports **two** simultaneous jobs by default (so this session and another Claude session can delegate at the same time); Kimi defaults to one. Jobs beyond capacity stay `queued` and start automatically when a slot frees instead of failing. Queued jobs can be cancelled cleanly before they start (`ai-worker cancel JOB_UUID` or the dashboard). Per-job Git worktrees, runtime directories, and worker environment state remain isolated under concurrency, so simultaneous isolated-edit jobs return separate diffs.
+
+```bash
+ai-worker settings show                          # shows budget plus per-worker slot capacity
+ai-worker settings set qwen-concurrency 2        # Qwen slots, 1-4 (default: 2)
+ai-worker settings set kimi-concurrency 1        # Kimi slots, 1-4 (default: 1)
+```
+
+Capacity changes apply to future jobs only and are stored in the same private `settings.json`; a settings file saved before these fields existed keeps working with the defaults above.
+
 Claude integration instructions are installed at `~/.claude/skills/delegate-workers/SKILL.md`. Start or restart Claude Code after updating the skill. Claude remains responsible for checking worker findings and responding. A Claude Bash/tool timeout must exceed the worker timeout, which defaults to 1800 seconds (30 minutes) for both Qwen and Kimi and can be lowered with `--timeout SECONDS` (accepted range 10–1800).
 
 ## Commands
@@ -72,8 +84,10 @@ ai-worker test kimi [--json]
 ai-worker delegate qwen --cwd PATH [--timeout SECONDS] [--max-tool-calls unlimited|N] [--json]  # isolated coding; task from stdin
 ai-worker delegate kimi --cwd PATH [--timeout SECONDS] [--json]  # isolated coding; task from stdin
 ai-worker delegate qwen|kimi --cwd PATH --mode read-only --json # analysis without edits
-ai-worker settings show                                # saved Qwen coding budget (default: unlimited)
+ai-worker settings show                                # saved budget and slot capacity defaults
 ai-worker settings set qwen-coding-budget unlimited|N  # save default for future Qwen coding jobs
+ai-worker settings set qwen-concurrency 1-4            # simultaneous Qwen jobs (default: 2)
+ai-worker settings set kimi-concurrency 1-4            # simultaneous Kimi jobs (default: 1)
 ai-worker diff JOB_UUID [--json]
 ai-worker discard JOB_UUID --confirm
 ai-worker run [--json]  # structured request from stdin

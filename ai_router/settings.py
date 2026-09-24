@@ -1,8 +1,9 @@
-"""User-private router runtime settings (saved budget presets; no credentials).
+"""User-private router runtime settings (saved operational presets; no credentials).
 
 The settings file lives in the router runtime directory as ``settings.json``.
 It stores only local operational defaults such as the Qwen isolated-edit
-tool-call budget. It never stores provider credentials or endpoints.
+tool-call budget and the per-worker job concurrency. It never stores provider
+credentials or endpoints.
 """
 
 import json
@@ -21,17 +22,43 @@ MAX_TOOL_CALLS_LIMIT = 1_000_000
 DEFAULT_QWEN_CODING_BUDGET = UNLIMITED_TOOL_CALLS
 READ_ONLY_QWEN_BUDGET = 24
 
+# Per-worker cross-process slot concurrency. Qwen supports two simultaneous
+# sessions by default; Kimi stays serialized at one. Extra jobs wait queued
+# until a slot frees instead of failing immediately.
+MAX_CONCURRENCY = 4
+DEFAULT_QWEN_CONCURRENCY = 2
+DEFAULT_KIMI_CONCURRENCY = 1
+
 # Introspectable field schema for the CLI and the upcoming dashboard Settings
-# view. Values are validated with validate_budget before any write.
+# view. Values are validated with validate_setting before any write.
 SETTINGS_FIELDS = {
     'qwen_coding_max_tool_calls': {
         'type': 'integer',
+        'kind': 'budget',
         'default': DEFAULT_QWEN_CODING_BUDGET,
         'minimum': UNLIMITED_TOOL_CALLS,
         'maximum': MAX_TOOL_CALLS_LIMIT,
         'unlimited_value': UNLIMITED_TOOL_CALLS,
         'applies_to': 'qwen isolated-edit jobs without an explicit max_tool_calls',
         'description': 'Saved Qwen coding tool-call budget; -1 means unlimited.',
+    },
+    'qwen_concurrency': {
+        'type': 'integer',
+        'kind': 'concurrency',
+        'default': DEFAULT_QWEN_CONCURRENCY,
+        'minimum': 1,
+        'maximum': MAX_CONCURRENCY,
+        'applies_to': 'qwen jobs across all ai-worker processes',
+        'description': 'Maximum simultaneous Qwen jobs; further jobs wait queued for a slot.',
+    },
+    'kimi_concurrency': {
+        'type': 'integer',
+        'kind': 'concurrency',
+        'default': DEFAULT_KIMI_CONCURRENCY,
+        'minimum': 1,
+        'maximum': MAX_CONCURRENCY,
+        'applies_to': 'kimi jobs across all ai-worker processes',
+        'description': 'Maximum simultaneous Kimi jobs; further jobs wait queued for a slot.',
     },
 }
 
@@ -58,6 +85,25 @@ def validate_budget(value) -> int:
     return value
 
 
+def validate_concurrency(value) -> int:
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise SettingsError('Concurrency must be an integer.', 'INVALID_REQUEST')
+    if not 1 <= value <= MAX_CONCURRENCY:
+        raise SettingsError(
+            f'Concurrency must be an integer from 1 to {MAX_CONCURRENCY}.',
+            'INVALID_REQUEST')
+    return value
+
+
+def validate_setting(name: str, value) -> int:
+    field = SETTINGS_FIELDS.get(name)
+    if field is None:
+        raise SettingsError(f'Unknown setting {name!r}.', 'INVALID_REQUEST')
+    if field['kind'] == 'budget':
+        return validate_budget(value)
+    return validate_concurrency(value)
+
+
 def parse_budget_token(text: str) -> int:
     """Parse a CLI budget token: 'unlimited' or a decimal integer 0..1000000."""
     if not isinstance(text, str):
@@ -70,6 +116,15 @@ def parse_budget_token(text: str) -> int:
             f'Budget must be unlimited or an integer from 0 to {MAX_TOOL_CALLS_LIMIT}.',
             'INVALID_REQUEST')
     return validate_budget(int(token, 10))
+
+
+def parse_concurrency_token(text: str) -> int:
+    """Parse a CLI concurrency token: a decimal integer 1..MAX_CONCURRENCY."""
+    if not isinstance(text, str) or not _INTEGER_TOKEN.fullmatch(text.strip()):
+        raise SettingsError(
+            f'Concurrency must be an integer from 1 to {MAX_CONCURRENCY}.',
+            'INVALID_REQUEST')
+    return validate_concurrency(int(text.strip(), 10))
 
 
 def _check_private_file(path: Path) -> None:
@@ -85,9 +140,10 @@ def _check_private_file(path: Path) -> None:
 def load_settings(runtime: Path) -> dict:
     """Return saved settings merged over defaults.
 
-    A missing file yields defaults. A symlink, unsafe ownership/permissions,
-    malformed JSON, or out-of-range values raise SettingsError; bad
-    configuration is never silently ignored or overwritten.
+    A missing file yields defaults. Older schema-1 files that predate the
+    concurrency fields load with those fields at their defaults. A symlink,
+    unsafe ownership/permissions, malformed JSON, or out-of-range values raise
+    SettingsError; bad configuration is never silently ignored or overwritten.
     """
     path = settings_path(runtime)
     defaults = {name: field['default'] for name, field in SETTINGS_FIELDS.items()}
@@ -104,11 +160,11 @@ def load_settings(runtime: Path) -> dict:
             '(it will not be overwritten automatically).') from None
     if not isinstance(data, dict) or data.get('schema_version') != SETTINGS_VERSION:
         raise SettingsError('Settings file has an unsupported schema; fix or remove it manually.')
-    value = data.get('qwen_coding_max_tool_calls', DEFAULT_QWEN_CODING_BUDGET)
-    try:
-        defaults['qwen_coding_max_tool_calls'] = validate_budget(value)
-    except SettingsError as exc:
-        raise SettingsError(f'Settings file contains an invalid budget: {exc}') from None
+    for name in SETTINGS_FIELDS:
+        try:
+            defaults[name] = validate_setting(name, data.get(name, defaults[name]))
+        except SettingsError as exc:
+            raise SettingsError(f'Settings file contains an invalid {name}: {exc}') from None
     return defaults
 
 
@@ -117,14 +173,25 @@ def load_qwen_coding_budget(runtime: Path) -> int:
     return load_settings(runtime)['qwen_coding_max_tool_calls']
 
 
-def save_settings(runtime: Path, *, qwen_coding_max_tool_calls) -> dict:
-    """Atomically persist a budget preset with 0600 permissions.
+def load_worker_concurrency(runtime: Path, worker: str) -> int:
+    """Saved cross-process slot capacity for one worker (qwen default 2, kimi 1)."""
+    if worker not in ('qwen', 'kimi'):
+        raise SettingsError(f'Unknown worker {worker!r}.', 'INVALID_REQUEST')
+    return load_settings(runtime)[f'{worker}_concurrency']
 
-    Existing configuration is validated first; malformed or unsafe files are
-    never silently overwritten.
+
+def save_settings(runtime: Path, *, qwen_coding_max_tool_calls=None,
+                  qwen_concurrency=None, kimi_concurrency=None) -> dict:
+    """Atomically persist settings with 0600 permissions.
+
+    Only the fields given an explicit value change; every other saved field is
+    preserved. Existing configuration is validated first; malformed or unsafe
+    files are never silently overwritten.
     """
     runtime = Path(runtime)
-    budget = validate_budget(qwen_coding_max_tool_calls)
+    overrides = {'qwen_coding_max_tool_calls': qwen_coding_max_tool_calls,
+                 'qwen_concurrency': qwen_concurrency,
+                 'kimi_concurrency': kimi_concurrency}
     try:
         info = runtime.stat()
     except OSError:
@@ -134,9 +201,14 @@ def save_settings(runtime: Path, *, qwen_coding_max_tool_calls) -> dict:
         raise SettingsError('Router runtime directory is missing or unsafe.')
     path = settings_path(runtime)
     if path.is_symlink() or path.exists():
-        load_settings(runtime)  # raises on unsafe/malformed existing config
-    payload = json.dumps({'schema_version': SETTINGS_VERSION,
-                          'qwen_coding_max_tool_calls': budget},
+        # Raises on unsafe/malformed existing config; never overwritten silently.
+        merged = load_settings(runtime)
+    else:
+        merged = {name: field['default'] for name, field in SETTINGS_FIELDS.items()}
+    for name, value in overrides.items():
+        if value is not None:
+            merged[name] = validate_setting(name, value)
+    payload = json.dumps({'schema_version': SETTINGS_VERSION, **merged},
                          ensure_ascii=False, separators=(',', ':')).encode('utf-8')
     fd, tmp_name = tempfile.mkstemp(dir=runtime, prefix='.settings-', suffix='.tmp')
     try:
