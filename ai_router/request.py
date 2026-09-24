@@ -53,8 +53,11 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
     if payload.get('worker') not in ('qwen', 'kimi'):
         raise RequestError('INVALID_WORKER', 'Worker must be qwen or kimi.')
     worker = payload['worker']
-    if payload.get('mode', 'read-only') != 'read-only':
-        raise RequestError('INVALID_MODE', 'Only read-only mode is enabled.')
+    mode = payload.get('mode', 'read-only')
+    if mode not in ('read-only', 'isolated-edit'):
+        raise RequestError('INVALID_MODE', 'Mode must be read-only or isolated-edit.')
+    if mode == 'isolated-edit' and worker != 'kimi':
+        raise RequestError('INVALID_MODE', 'Isolated editing is available only for Kimi.')
     task = payload.get('task')
     context = payload.get('context', '')
     if not isinstance(task, str) or not task.strip() or len(task.encode('utf-8')) > MAX_TASK_BYTES:
@@ -87,4 +90,4 @@ def parse_request(raw: bytes, allowed_roots: tuple[Path, ...]) -> WorkerRequest:
         raise RequestError('INVALID_REQUEST', 'Parent job ID must be a UUID.')
     if payload.get('delegation_group_id') is not None and group is None:
         raise RequestError('INVALID_REQUEST', 'Delegation group ID must be a UUID.')
-    return WorkerRequest(worker, task, context, resolved, 'read-only', timeout, parent, group)
+    return WorkerRequest(worker, task, context, resolved, mode, timeout, parent, group)

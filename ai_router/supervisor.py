@@ -17,6 +17,7 @@ import uuid
 from .request import parse_request, WorkerRequest
 from .security import MAX_TEXT, redact
 from .state import StateStore
+from workers.base import WorkerSetupError
 
 
 MAX_STDOUT = 2 * 1024 * 1024
@@ -54,14 +55,22 @@ class RunResult:
     reported_model: str | None
     error: dict | None
     result_truncated: bool = False
+    workspace: dict | None = None
+    diff: str | None = None
+    diff_truncated: bool = False
 
     def json(self):
-        return {'schema_version':1,'job_id':self.job_id,'worker':self.worker,
+        value = {'schema_version':1,'job_id':self.job_id,'worker':self.worker,
                 'requested_model':self.requested_model,'worker_version':self.worker_version,
                 'reported_model':self.reported_model,
                 'status':self.status,'started_at':self.started_at,'completed_at':self.completed_at,
                 'duration_ms':self.duration_ms,'exit_code':self.exit_code,'result':self.result,
                 'error':self.error,'result_truncated':self.result_truncated}
+        if self.workspace is not None:
+            value['workspace'] = self.workspace
+            value['diff'] = self.diff
+            value['diff_truncated'] = self.diff_truncated
+        return value
 
 
 class Supervisor:
@@ -157,6 +166,7 @@ class Supervisor:
         started_mono = time.monotonic()
         started_at = None
         proc = None
+        launch_request = request
         stdout_data = bytearray()
         stderr_data = bytearray()
         try:
@@ -165,16 +175,19 @@ class Supervisor:
             except BlockingIOError:
                 self.state.fail_queued(job_id,'WORKER_BUSY','A job for this worker is already running.')
                 return self._failure(job_id,request,adapter,'failed','WORKER_BUSY','Worker is busy.',None,started_mono,None,worker_version)
-            command = adapter.build_command(request,job_id)
+            prepare = getattr(adapter, 'prepare_request', None)
+            if callable(prepare):
+                launch_request = prepare(request,job_id)
+            command = adapter.build_command(launch_request,job_id)
             if not command or any(not isinstance(part,str) or '\x00' in part for part in command):
                 raise ValueError('Invalid worker command.')
-            payload = adapter.build_payload(request,job_id)
+            payload = adapter.build_payload(launch_request,job_id)
             if not isinstance(payload,bytes) or len(payload)>320*1024:
                 raise ValueError('Worker input exceeds the bounded payload size.')
-            env = adapter.build_environment()
+            env = adapter.build_environment(job_id)
             if not isinstance(env,dict) or any(not isinstance(k,str) or not isinstance(v,str) or '\x00' in k+v for k,v in env.items()):
                 raise ValueError('Invalid child environment.')
-            proc = subprocess.Popen(command,cwd=request.cwd,env=env,stdin=subprocess.PIPE,
+            proc = subprocess.Popen(command,cwd=launch_request.cwd,env=env,stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,stderr=subprocess.PIPE,start_new_session=True,close_fds=True)
             proc_start = self._proc_start(proc.pid,proc.pid)
             if proc_start is None:
@@ -215,9 +228,26 @@ class Supervisor:
                 elif status!='completed' and persisted.get('error_code'):
                     err={'code':persisted['error_code'],'message':persisted.get('error_message')}
             completed = self._now()
+            workspace = diff = None
+            diff_truncated = False
+            collect_edit = getattr(adapter, 'collect_edit_output', None)
+            if request.mode == 'isolated-edit' and callable(collect_edit):
+                try:
+                    workspace, diff, diff_truncated = collect_edit(job_id)
+                except Exception:
+                    workspace, diff = {'error':'DIFF_UNAVAILABLE'}, None
             return RunResult(job_id,request.worker,adapter.requested_model,worker_version,status,started_at,completed,
                 duration,proc.returncode,final,parsed.reported_model if parsed else None,err,
-                bool(parsed and len(parsed.text)>MAX_TEXT))
+                bool(parsed and len(parsed.text)>MAX_TEXT),workspace,diff,diff_truncated)
+        except WorkerSetupError as exc:
+            if proc is not None and proc.poll() is None:
+                self._terminate(proc)
+            try:
+                self.state.fail_queued(job_id,exc.code,str(exc))
+            except sqlite3.Error:
+                pass
+            return self._failure(job_id,request,adapter,'failed',exc.code,str(exc),
+                                 proc.returncode if proc else None,started_mono,started_at,worker_version)
         except Exception:
             if proc is not None and proc.poll() is None:
                 self._terminate(proc)

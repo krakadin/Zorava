@@ -7,6 +7,12 @@ from typing import Protocol
 from ai_router.request import WorkerRequest
 
 
+class WorkerSetupError(RuntimeError):
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
 @dataclass(frozen=True)
 class ParsedOutput:
     text: str
@@ -25,7 +31,7 @@ class WorkerAdapter(Protocol):
     def build_command(self, request: WorkerRequest, job_id: str) -> list[str]: ...
     def build_payload(self, request: WorkerRequest, job_id: str) -> bytes: ...
     def parse_output(self, raw: bytes) -> ParsedOutput: ...
-    def build_environment(self) -> dict[str, str]: ...
+    def build_environment(self, job_id: str | None = None) -> dict[str, str]: ...
     def cleanup(self, job_id: str) -> None: ...
 
 

@@ -47,7 +47,7 @@ class FakeAdapter:
         return json.dumps({'job_id':job_id,'task':request.task,'context':request.context,
                            'cwd':str(request.cwd),'mode':request.mode}).encode()
 
-    def build_environment(self):
+    def build_environment(self, job_id=None):
         return common_child_environment() | self.extra_env
 
     def parse_output(self, raw):
@@ -90,6 +90,13 @@ class RequestAndRedactionTests(SupervisorFixture):
                 with self.assertRaises(RequestError) as caught:
                     parse_request(self.request(**changes),(self.root,))
                 self.assertEqual(caught.exception.code,code)
+
+    def test_isolated_edit_mode_is_kimi_only(self):
+        request=parse_request(self.request(worker='kimi',mode='isolated-edit'),(self.root,))
+        self.assertEqual(request.mode,'isolated-edit')
+        with self.assertRaises(RequestError) as caught:
+            parse_request(self.request(mode='isolated-edit'),(self.root,))
+        self.assertEqual(caught.exception.code,'INVALID_MODE')
 
     def test_bad_json_and_size_limits(self):
         with self.assertRaises(RequestError): parse_request(b'{', (self.root,))

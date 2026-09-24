@@ -2,6 +2,7 @@ import json
 import os
 from pathlib import Path
 import stat
+import subprocess
 import tempfile
 import unittest
 
@@ -82,6 +83,77 @@ class KimiAdapterTests(unittest.TestCase):
         os.chmod(self.runtime_tmp, 0o755)
         with self.assertRaises(RuntimeError):
             self.adapter.build_command(self.request, 'f0b43ac1-7443-403c-b588-c2aa9f486c60')
+
+    def make_clean_repo(self):
+        repo = self.root / 'git-project'
+        repo.mkdir()
+        subprocess.run(['/usr/bin/git','init','-q',str(repo)],check=True)
+        subprocess.run(['/usr/bin/git','-C',str(repo),'config','user.name','AI Worker Test'],check=True)
+        subprocess.run(['/usr/bin/git','-C',str(repo),'config','user.email','ai-worker-test@example.invalid'],check=True)
+        (repo/'app.py').write_text('value = 1\n')
+        subprocess.run(['/usr/bin/git','-C',str(repo),'add','app.py'],check=True)
+        subprocess.run(['/usr/bin/git','-C',str(repo),'commit','-q','-m','fixture'],check=True)
+        return repo
+
+    def test_isolated_edit_prepares_clean_worktree_and_private_kimi_home(self):
+        self.adapter.runtime_jobs=self.root/'runtime'/'jobs'
+        self.adapter.runtime_jobs.mkdir(parents=True,mode=0o700)
+        os.chmod(self.adapter.runtime_jobs,0o700)
+        repo=self.make_clean_repo()
+        from dataclasses import replace
+        edit_request=replace(self.request, cwd=repo, mode='isolated-edit')
+        job_id='640e098b-92cd-460e-a746-6d743e8d70df'
+        launch=self.adapter.prepare_request(edit_request,job_id)
+        job_dir=self.adapter.runtime_jobs/job_id
+        self.assertEqual(launch.cwd,job_dir/'worktree')
+        self.assertEqual(stat.S_IMODE(job_dir.stat().st_mode),0o700)
+        edit_env=self.adapter.build_environment(job_id)
+        self.assertEqual(edit_env['KIMI_CODE_HOME'],str(job_dir/'kimi-home'))
+        for name in ('ANTHROPIC_API_KEY','ANTHROPIC_AUTH_TOKEN','DASHSCOPE_API_KEY','KIMI_API_KEY'):
+            self.assertNotIn(name,edit_env)
+        command=self.adapter.build_command(launch,job_id)
+        self.assertEqual(command[0],'/usr/bin/python3')
+        self.assertIn('--write-root',command)
+        profile=Path(command[command.index('--agent-file')+1]).read_text()
+        self.assertIn('mcp__aiworker__write_file',profile)
+        (launch.cwd/'app.py').write_text('value = 2\n')
+        (launch.cwd/'.env').write_text('FAKE_TEST_SECRET=must-not-appear\n')
+        (launch.cwd/'outside-link').symlink_to('/etc/passwd')
+        workspace,diff,truncated=self.adapter.collect_edit_output(job_id)
+        self.assertIn('app.py',workspace['changed_files'])
+        self.assertIn('+value = 2',diff)
+        self.assertNotIn('.env',workspace['changed_files'])
+        self.assertNotIn('FAKE_TEST_SECRET',diff)
+        self.assertNotIn('root:',diff)
+        self.assertFalse(truncated)
+        self.adapter.cleanup(job_id)
+        self.assertFalse((job_dir/'request.json').exists())
+        self.assertTrue(launch.cwd.exists())
+        self.assertEqual(subprocess.check_output(['/usr/bin/git','-C',str(repo),'status','--porcelain']),b'')
+        subprocess.run(['/usr/bin/git','-C',str(repo),'worktree','remove','--force',str(launch.cwd)],check=True)
+        import shutil
+        shutil.rmtree(job_dir)
+
+    def test_sensitive_diff_paths_are_rejected(self):
+        for path in ('.env', '.env.local', 'credentials.json', 'nested/private.pem',
+                     '../escape', '/etc/passwd', '.git/config'):
+            with self.subTest(path=path):
+                self.assertFalse(self.adapter._safe_diff_path(path))
+        self.assertTrue(self.adapter._safe_diff_path('src/main.py'))
+
+    def test_isolated_edit_rejects_dirty_primary_without_touching_it(self):
+        self.adapter.runtime_jobs=self.root/'runtime'/'jobs'
+        self.adapter.runtime_jobs.mkdir(parents=True,mode=0o700)
+        os.chmod(self.adapter.runtime_jobs,0o700)
+        repo=self.make_clean_repo()
+        (repo/'app.py').write_text('dirty\n')
+        from dataclasses import replace
+        from workers.base import WorkerSetupError
+        with self.assertRaises(WorkerSetupError) as caught:
+            self.adapter.prepare_request(replace(self.request,cwd=repo,mode='isolated-edit'),
+                                         '4e86e90b-1753-40ae-8e4b-19252e74b6fd')
+        self.assertEqual(caught.exception.code,'PROJECT_DIRTY')
+        self.assertEqual((repo/'app.py').read_text(),'dirty\n')
 
 
 if __name__ == '__main__':

@@ -14,6 +14,14 @@ The Kimi profile allowlists the installed CLI's exact read tools: `Read`, `Grep`
 
 These are application-level tool restrictions and prompt policy, not a kernel sandbox. The subprocess runs as the same Unix user, and Kimi CLI can access the user's Kimi-owned configuration because it needs its own authentication. Do not delegate a repository or context that must not be sent to Kimi. Provider-side retention is controlled by Kimi's service/account terms, not ai-router.
 
+## Opt-in isolated-edit mode
+
+The explicit `isolated-edit` mode is only available for Kimi. The source checkout must be clean. Kimi works in a detached per-job Git worktree under the private runtime directory; it cannot modify the primary checkout through the configured tools. The Kimi profile has no shell, built-in filesystem tools, or subagents. It receives only a local MCP broker whose read/write operations validate worktree-relative paths, deny symlinks, and exclude credential-like/control paths. Task text is fetched through that broker, not command-line arguments.
+
+The worker process is additionally confined with Linux Landlock. On this machine the kernel reports Landlock ABI 8, and automated probes confirmed writes inside an allowed root succeed while writes outside it and through an escaping symlink fail. Edit mode fails closed if Landlock cannot be activated. Writes are permitted inside the job runtime directory and Kimi's own credential directory so the CLI can maintain its session and refresh its own OAuth; the model-facing MCP broker does not expose that credential directory. The worker can still read arbitrary paths at the OS level, because read access is not restricted by this Landlock policy. This is not a complete filesystem sandbox.
+
+The Git worktree is not treated as security isolation. It prevents accidental changes to the primary checkout; Landlock write confinement and the MCP file broker provide the additional controls. No tests, shell commands, package installs, commits, pushes, merges, or deployment are offered in edit mode. Kimi returns a bounded sanitized diff and Claude reviews it; no patch is automatically applied. The per-job worktree and Kimi session history persist until the operator explicitly reviews and runs `ai-worker discard JOB_UUID --confirm`.
+
 The requested working directory is resolved and must be beneath `/home/krakadin/myDev`. This prevents simple traversal and symlink escapes for `cwd`; it does not prevent all symlinked file access within a repository. The profile does not expose shell/network tools, but same-user OS isolation is not claimed.
 
 ## Local data and redaction
