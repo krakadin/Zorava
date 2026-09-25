@@ -153,6 +153,44 @@
     }
     tr.append(action); return tr;
   }
+  // Cache-only usage/quota section of a provider card. Percentages are computed
+  // server-side from validated ratios; Qwen never gets a fabricated percentage.
+  function usageSection(info) {
+    const usage=info.usage||{};
+    const box=node('div',undefined,'usage');
+    box.append(node('h3','Usage'));
+    if (info.worker==='kimi') {
+      box.append(node('p',usage.detail || 'Kimi account quota has not been checked yet.','muted'));
+      (usage.windows||[]).forEach(item=>{
+        const row=node('div',undefined,'usage-window');
+        row.append(node('span',item.name,'usage-name'));
+        row.append(node('strong',`${item.used_percent}% used`,'mono'));
+        row.append(node('span',`${item.remaining_percent}% remaining`,'mono'));
+        row.append(node('span',`resets ${item.reset_at?displayTime(item.reset_at):'unknown'}`,'muted'));
+        box.append(row);
+      });
+      box.append(node('p',`Quota state: ${usage.state || 'unknown'}${usage.checked_at?' · checked '+displayTime(usage.checked_at):' · not checked yet'}`,'muted'));
+      const actions=node('div',undefined,'provider-actions');
+      actions.append(node('small','Explicit refresh only: reads the already-running local Kimi server. Page refreshes never fetch quota or start kimi web.'));
+      const button=node('button','Refresh usage');
+      button.dataset.action='refresh-usage';
+      actions.append(button); box.append(actions);
+    } else if (info.worker==='qwen') {
+      box.append(node('p',usage.detail || 'Account-level remaining quota is unavailable for Qwen.','notice'));
+    }
+    const tokens=usage.job_tokens;
+    if (tokens && tokens.jobs_with_usage>0) {
+      const dl=node('dl',undefined,'kv');
+      const format=value=>value==null?'partial':Number(value).toLocaleString();
+      addKV(dl,'Job tokens',`in ${format(tokens.input_tokens)} · out ${format(tokens.output_tokens)} · cached ${format(tokens.cached_tokens)}`,true);
+      addKV(dl,'Counted',`${tokens.jobs_with_usage} of ${tokens.jobs_completed} completed jobs`);
+      box.append(dl);
+      if (tokens.scope) box.append(node('p',tokens.scope,'muted'));
+    } else if (tokens) {
+      box.append(node('p','No completed jobs with recorded token usage yet.','muted'));
+    }
+    return box;
+  }
   function providerCard(info) {
     const testing = info.status === 'TESTING' || pendingTests.has(info.worker);
     const checking = info.update_checking === true || pendingUpdates.has(info.worker);
@@ -185,6 +223,7 @@
     if (info.last_success_at) addKV(dl,'Last passed',displayTime(info.last_success_at));
     if (info.last_test_error) addKV(dl,'Test error',info.last_test_error);
     card.append(dl);
+    if (info.usage) card.append(usageSection(info));
     if (info.worker === 'qwen' || info.worker === 'kimi') {
       const actions=node('div',undefined,'provider-actions');
       actions.append(node('small',`Makes a small live ${info.worker === 'qwen' ? 'Token Plan' : 'provider'} request.`));
@@ -254,6 +293,24 @@
     }
     pendingUpdates.delete(worker);
     throw new Error('The CLI version check is still running. Refresh Providers to see its result.');
+  }
+  // The quota refresh runs in the cache's own cooldown-limited thread; this
+  // loop only reads the cache-only usage endpoint until it settles, so polling
+  // never triggers a quota fetch or starts kimi web.
+  async function followUsageRefresh() {
+    const deadline=Date.now()+15000;
+    while (Date.now()<deadline) {
+      const data=await get('/api/v1/usage');
+      const quota=data.kimi_quota||{};
+      if (quota.state!=='checking') {
+        await refreshProviderCards();
+        flash(`Kimi quota is now ${quota.state||'unknown'}${quota.checked_at?` · checked ${displayTime(quota.checked_at)}`:''}.`);
+        return;
+      }
+      await new Promise(resolve=>setTimeout(resolve,1000));
+    }
+    await refreshProviderCards();
+    flash('The quota refresh is still running; the card updates on the next automatic refresh.');
   }
   async function overview() {
     title('Overview','Local worker health, active jobs, and recent outcomes.');
@@ -421,6 +478,12 @@
         flash(`Requested the ${worker.toUpperCase()} CLI version check. Nothing is downloaded or installed.`);
         await refreshProviderCards();
         await followUpdateCheck(worker);
+      } else if(action==='refresh-usage'){
+        button.textContent='Refreshing…';
+        const result=await post('/api/v1/usage/refresh');
+        flash(result.note || 'Kimi quota refresh requested.');
+        await refreshProviderCards();
+        if(result.refresh_started) await followUsageRefresh();
       } else if(action==='cancel'){
         if(!window.confirm('Cancel this worker job?')) return;
         const result=await post(`/api/v1/jobs/${encodeURIComponent(button.dataset.id)}/cancel`);

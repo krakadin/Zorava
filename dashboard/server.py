@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 import fcntl
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 import secrets
@@ -21,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
+from ai_router.kimi_quota import QUOTA_REFRESH_COOLDOWN_S, QuotaCache
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.settings import (SETTINGS_FIELDS, SettingsError, load_worker_concurrency,
@@ -44,10 +46,14 @@ MAX_HTTP_BODY = 4096
 
 
 class DashboardController:
-    def __init__(self, runtime: Path = RUNTIME, port: int = DEFAULT_PORT):
+    def __init__(self, runtime: Path = RUNTIME, port: int = DEFAULT_PORT, quota_cache=None):
         self.runtime = runtime
         self.port = port
         self.store = StateStore(runtime / 'workers.db')
+        # Kimi account-quota cache. Construction and describe() are memory-only;
+        # a refresh happens solely through the explicit POST action below and
+        # only touches an already-running local Kimi server. Injectable in tests.
+        self.quota_cache = quota_cache if quota_cache is not None else QuotaCache()
         self.csrf_token = secrets.token_urlsafe(32)
         self._lock = threading.RLock()
         self._test_processes: dict[str, tuple[str, subprocess.Popen]] = {}
@@ -141,6 +147,7 @@ class DashboardController:
             starting_workers = {worker for worker, _proc in self._test_processes.values()}
         now = datetime.now(timezone.utc)
         activity = self.store.worker_activity()
+        usage = self.usage_snapshot()
         values = {}
         for name in ('qwen', 'kimi'):
             info = dict(self.provider_snapshot[name])
@@ -173,6 +180,13 @@ class DashboardController:
                          'running_jobs': activity.get(name, {}).get('running', 0),
                          'role': 'Coder', 'default_mode': 'isolated-edit'})
             info.update(self.updates.status(name, info.get('version')).as_dict())
+            # Cache-only usage/quota view for the provider card: Kimi shows the
+            # QuotaCache snapshot; Qwen honestly reports that account-level
+            # remaining quota is unavailable and shows per-job token totals.
+            quota_key = 'kimi_quota' if name == 'kimi' else 'qwen_quota'
+            info['usage'] = dict(usage[quota_key])
+            info['usage']['job_tokens'] = dict(usage['job_token_totals'][name],
+                                               scope=usage['job_token_totals']['scope'])
             values[name] = info
         values['claude'] = self.provider_snapshot['claude']
         return values
@@ -198,6 +212,51 @@ class DashboardController:
                 'already_checking': queued['already_checking'], 'deferred': queued['deferred'],
                 'note': 'Read-only version metadata; nothing is downloaded or installed.',
                 'updates': self.updates.snapshot(self._installed_versions())}
+
+    def usage_snapshot(self) -> dict:
+        """Cache-only usage/quota view; performs no network or CLI activity.
+
+        Kimi account quota comes from QuotaCache.describe(), which is
+        memory-only, and job token totals are local SQLite reads, so this
+        method never fetches quota or starts `kimi web`. Qwen has no reliable
+        account-quota API, so it honestly reports unavailability plus local
+        per-job token totals instead of a fabricated percentage.
+        """
+        quota = self.quota_cache.describe()
+        windows = []
+        for window in quota.get('windows', []):
+            ratio = window.get('used_ratio')
+            if type(ratio) not in (int, float) or not math.isfinite(ratio) or not 0 <= ratio <= 1:
+                continue
+            used = _percent(ratio)
+            windows.append({'name': window.get('name'), 'used_percent': used,
+                            'remaining_percent': 100 - used,
+                            'reset_at': window.get('reset_at')})
+        return {'cache_only': True,
+                'kimi_quota': {'worker': 'kimi', 'state': quota['state'], 'windows': windows,
+                               'detail': quota['detail'], 'checked_at': quota['checked_at'],
+                               'last_attempt_at': quota['last_attempt_at'],
+                               'refresh_cooldown_seconds': int(QUOTA_REFRESH_COOLDOWN_S)},
+                'qwen_quota': {'worker': 'qwen', 'state': 'unavailable', 'windows': [],
+                               'detail': 'Account-level remaining quota is unavailable for Qwen; '
+                                         'only per-job token totals are shown.',
+                               'checked_at': None, 'last_attempt_at': None},
+                'job_token_totals': self.store.job_token_totals()}
+
+    def request_usage_refresh(self) -> dict:
+        """Explicit operator action: one cooldown-limited Kimi quota refresh.
+
+        Only QuotaCache.request_check() is invoked, and bounded state metadata
+        is returned. No credential, local server token, raw provider response,
+        or caller-supplied URL is involved or exposed.
+        """
+        started = self.quota_cache.request_check()
+        return {'status': 'accepted', 'refresh_started': started, 'deferred': not started,
+                'note': ('Kimi quota refresh started; the provider card updates from the cache.'
+                         if started else
+                         'Kimi quota refresh deferred: a check is already running or within the '
+                         f"{int(QUOTA_REFRESH_COOLDOWN_S)}s cooldown."),
+                'kimi_quota': self.usage_snapshot()['kimi_quota']}
 
     def _slot_lock_paths(self, worker: str) -> list[Path]:
         """Every slot lock a supervisor could currently hold for this worker."""
@@ -340,6 +399,11 @@ class DashboardController:
         self.updates.shutdown(timeout=8)
 
 
+def _percent(used_ratio):
+    """Whole-percent conversion of an already validated [0,1] ratio."""
+    return min(100, max(0, round(used_ratio * 100)))
+
+
 def _parse_time(value):
     if not value:
         return None
@@ -480,6 +544,11 @@ def make_handler(controller: DashboardController):
                 if path == '/api/v1/updates':
                     # Cache-only: a dashboard refresh must never reach a version source.
                     self._json(controller.updates_snapshot()); return
+                if path == '/api/v1/usage':
+                    # Cache-only: describe() is memory-only and job token totals
+                    # are local SQLite reads; a dashboard refresh must never
+                    # fetch quota or start kimi web.
+                    self._json(controller.usage_snapshot()); return
                 if path == '/api/v1/permissions':
                     coding = {'role':'Coder','filesystem':'Create and edit source files in a separate Git worktree by default; read-only mode remains available',
                               'shell':'not exposed','git_writes':'worktree edits; diff returned for review',
@@ -551,6 +620,13 @@ def make_handler(controller: DashboardController):
                     except ValueError as exc:
                         return self._error(400,'INVALID_REQUEST',str(exc))
                     self._json(result,202); return
+                if path == '/api/v1/usage/refresh':
+                    # Explicit operator action only. It calls
+                    # QuotaCache.request_check() (cooldown-limited, nonblocking)
+                    # and returns bounded state metadata: never credentials,
+                    # the local server token, a raw provider body, or a
+                    # caller-supplied URL.
+                    self._json(controller.request_usage_refresh(),202); return
                 if path == '/api/v1/settings/concurrency':
                     # One worker per request. Validation and the atomic 0600
                     # write reuse the CLI settings path, so malformed or unsafe

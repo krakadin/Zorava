@@ -292,6 +292,54 @@ class StateStore:
             entry[row['status']] = row['count']
         return counts
 
+    def job_token_totals(self, *, limit=1000):
+        """Bounded per-worker per-job token sums over retained completed jobs.
+
+        Only local rows are read. A counter total stays None (unknown) when no
+        completed job recorded usage or when any usage-bearing row lacked that
+        counter; partial sums are never presented as complete totals, and these
+        per-job sums are never account-level remaining quota.
+        """
+        keys = ('input_tokens', 'output_tokens', 'cached_tokens')
+        with self.connect() as db:
+            rows = db.execute(
+                "SELECT worker,usage_json FROM jobs WHERE status='completed' "
+                "AND worker IN ('qwen','kimi') ORDER BY created_at DESC LIMIT ?",
+                (max(1, min(int(limit), 5000)),)).fetchall()
+        totals = {}
+        for row in rows:
+            entry = totals.setdefault(row['worker'], {'jobs_completed': 0, 'jobs_with_usage': 0,
+                                                      **{key: 0 for key in keys},
+                                                      **{key + '_complete': True for key in keys}})
+            entry['jobs_completed'] += 1
+            try:
+                usage = json.loads(row['usage_json']) if row['usage_json'] else None
+            except ValueError:
+                usage = None
+            if not isinstance(usage, dict):
+                continue
+            entry['jobs_with_usage'] += 1
+            for key in keys:
+                value = usage.get(key)
+                if type(value) is int and value >= 0:
+                    entry[key] += value
+                else:
+                    entry[key + '_complete'] = False
+        result = {'scope': 'Completed jobs in retained history'}
+        for worker in ('qwen', 'kimi'):
+            entry = totals.get(worker)
+            summary = {'jobs_completed': 0, 'jobs_with_usage': 0,
+                       'input_tokens': None, 'output_tokens': None, 'cached_tokens': None}
+            if entry is not None:
+                summary['jobs_completed'] = entry['jobs_completed']
+                summary['jobs_with_usage'] = entry['jobs_with_usage']
+                if entry['jobs_with_usage']:
+                    for key in keys:
+                        if entry[key + '_complete']:
+                            summary[key] = entry[key]
+            result[worker] = summary
+        return result
+
     def is_cancel_requested(self, job_id):
         with self.connect() as db:
             row = db.execute('SELECT cancel_requested FROM jobs WHERE id=?', (job_id,)).fetchone()
