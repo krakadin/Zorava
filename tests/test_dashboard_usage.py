@@ -268,7 +268,7 @@ class DashboardUsageTests(unittest.TestCase):
         data = json.loads(body)
         self.assertEqual(data['job_token_totals']['qwen']['input_tokens'], 15)
         self.assertIsNone(data['job_token_totals']['qwen']['output_tokens'])
-        self.assertNotIn('balance', body.lower())
+        self.assertNotIn(b'balance', body.lower())
 
     def test_job_token_totals_is_bounded(self):
         self.add_job('qwen', 'completed', {'input_tokens': 1, 'output_tokens': 1, 'cached_tokens': 0})
