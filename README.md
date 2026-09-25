@@ -328,7 +328,7 @@ ai-worker settings set kimi-model kimi-code/k3      # verified managed Kimi alia
 - **Qwen Token Plan scope.** Zorava limits the Qwen path to synchronous, user-initiated tasks from an active host session; there is no scheduled, unattended, bulk, or standalone service path. That is a reasoned reading of Alibaba's interactive coding-agent terms, and Alibaba has not expressly endorsed this exact nested arrangement. Read [SECURITY_CHECKPOINT.md](SECURITY_CHECKPOINT.md) before enabling Qwen delegation.
 - **Credential rotation helper.** `tools/update_qwen_credential.py` is an optional, operator-run administrative tool that writes a replacement key into Qwen's own settings using hidden terminal input, an explicit typed confirmation, and an atomic 0600 write. It is not a credential store, never prints the value, and does not call any provider.
 
-Full details: [Security checkpoint](SECURITY_CHECKPOINT.md) and the operational security notes in [docs/operations.md](docs/operations.md).
+Full details: [Security model](docs/security.md), [Security checkpoint](SECURITY_CHECKPOINT.md), and the operational security notes in [docs/operations.md](docs/operations.md).
 
 ## Development and testing
 
@@ -370,5 +370,6 @@ Planned direction — **none of the items below are implemented in this reposito
 - [Repository on GitHub](https://github.com/krakadin/Zorava) — canonical source, issue tracker, and project links.
 - [Architecture](docs/architecture.md) — worker routes, invocation details, sandboxing, dashboard internals.
 - [Operations](docs/operations.md) — daily use, full command list, health interpretation, error codes, version handling, rollback.
+- [Security model](docs/security.md) — credential boundaries, read-only and isolated-edit controls, redaction, threat model, and limitations.
 - [Security checkpoint](SECURITY_CHECKPOINT.md) — the credential-remediation record, credential boundaries, and the Qwen Token Plan usage-scope decision.
 - [Audit](AUDIT.md) and [implementation spec](IMPLEMENTATION_SPEC.md) — historical source records for the system's design and requirements.
