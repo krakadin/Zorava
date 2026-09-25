@@ -320,7 +320,7 @@
     ['claude','qwen','kimi'].forEach(name=>cards.append(providerCard(data.providers[name])));root.append(cards);
     const note=node('p','Credentials remain in their provider-owned CLI configuration. Test status refreshes automatically from local records; provider calls only run when you click Test. CLI version metadata is cached: a version source is read only when you click Check for upgrades, and this dashboard never installs an upgrade.','notice');root.append(note);
     const config=panel('MODEL AND ROUTING');
-    config.append(node('p','The dashboard currently reports the verified model profile. Changing models or provider URLs is not enabled here; only locally verified model/endpoint combinations should be added. Qwen’s Token Plan key must not be sent to its separate pay-as-you-go endpoints.','prose'));
+    config.append(node('p','Selecting among locally verified model profiles is available on the Settings page. Provider URLs and credentials are never shown or editable here; Qwen stays on its reviewed Token Plan endpoint and its key, and Kimi stays on its managed Kimi Code provider. Qwen’s Token Plan key must not be sent to its separate pay-as-you-go endpoints.','prose'));
     root.append(config);
   }
   async function permissionsPage() {
@@ -362,6 +362,34 @@
       capacity.append(row);
     }
     root.append(capacity);
+    const models=data.models||{};
+    const modelPanel=panel('MODEL PROFILES');
+    modelPanel.append(node('p','Only locally verified provider model profiles are listed. Qwen profiles are limited to its reviewed Token Plan configuration; Kimi profiles come from its managed Kimi Code configuration. Endpoint and credential changes are not exposed or possible here. Changes apply to future jobs only.','notice'));
+    for(const worker of ['qwen','kimi']) {
+      const info=models[worker]||{selected:null,available:[]};
+      const label=worker==='qwen'?'Qwen':'Kimi';
+      const row=node('div',undefined,'setting-row');
+      const field=node('label',`${label} model profile`);
+      const select=document.createElement('select');select.id=`model-${worker}`;select.name=`model-${worker}`;
+      let listed=false;
+      (Array.isArray(info.available)?info.available:[]).forEach(option=>{
+        const item=node('option',option.context_window?`${option.display_name||option.id} · ${option.context_window} ctx`:(option.display_name||option.id));
+        item.value=option.id;
+        if(option.id===info.selected){item.selected=true;listed=true;}
+        select.append(item);
+      });
+      if(info.selected && !listed){
+        // A saved profile that is not currently verifiable is shown for
+        // transparency; the worker fails closed until a verified profile is chosen.
+        const item=node('option',`${info.selected} (saved; not currently verified)`);
+        item.value=info.selected;item.selected=true;select.append(item);
+      }
+      field.append(select);row.append(field);
+      row.append(node('small',info.selected?`Current: ${info.selected} · verified local profiles only`:'Verified local profiles only'));
+      const save=node('button','Save','primary');save.dataset.action='save-model';save.dataset.worker=worker;row.append(save);
+      modelPanel.append(row);
+    }
+    root.append(modelPanel);
     const cleanup=panel('RETENTION CLEANUP');cleanup.append(node('p','Expired Zorava job records, results, and event logs older than 30 days can be purged. Active jobs and retained Kimi isolated-edit worktrees are protected. Provider CLI histories are never touched.','notice'));
     const actions=node('div',undefined,'actions-bar');const preview=node('button','Preview expired records');preview.dataset.action='cleanup-preview';actions.append(preview);cleanup.append(actions);const output=node('div');output.id='cleanup-preview';cleanup.append(output);root.append(cleanup);
   }
@@ -403,6 +431,13 @@
         if(!select) throw new Error('Concurrency selector is not available on this page.');
         const result=await post('/api/v1/settings/concurrency',{worker:worker,concurrency:Number.parseInt(select.value,10)});
         flash(result.note || `Saved ${worker} concurrency.`);
+        await rerenderKeepingScroll(settingsPage);
+      } else if(action==='save-model'){
+        const worker=button.dataset.worker;
+        const select=document.querySelector(`#model-${worker}`);
+        if(!select) throw new Error('Model selector is not available on this page.');
+        const result=await post('/api/v1/settings/model',{worker:worker,model:select.value});
+        flash(result.note || `Saved ${worker} model profile.`);
         await rerenderKeepingScroll(settingsPage);
       } else if(action==='cleanup-preview'){
         const result=await post('/api/v1/cleanup/preview');const target=document.querySelector('#cleanup-preview');target.replaceChildren();

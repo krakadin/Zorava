@@ -16,7 +16,8 @@ from http.server import ThreadingHTTPServer
 
 from ai_router import updates
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
-from ai_router.settings import load_settings, load_worker_concurrency, save_settings, settings_path
+from ai_router.settings import (load_settings, load_worker_concurrency, load_worker_model_profile,
+                                save_settings, settings_path)
 from ai_router.state import StateStore
 from dashboard.server import DashboardController, make_handler, serve
 
@@ -249,6 +250,147 @@ class DashboardTests(unittest.TestCase):
         # Rejected requests never write, and the endpoint is POST-only.
         self.assertFalse(settings_path(self.runtime).exists())
         self.assertEqual(self.request('GET', '/api/v1/settings/concurrency')[0], 404)
+
+    def install_model_discovery(self):
+        """Offline verified-profile discovery; no provider config is read."""
+        qwen=[{'id':'qwen3.8-max','display_name':'qwen3.8-max','context_window':1000000},
+              {'id':'qwen3.8-flash','display_name':'qwen3.8-flash','context_window':None}]
+        kimi=[{'id':'kimi-code/k3','display_name':'kimi-code/k3','context_window':1048576},
+              {'id':'kimi-code/k3-256k','display_name':'kimi-code/k3-256k','context_window':262144}]
+        patches=(patch('workers.qwen.verified_model_profiles',return_value=qwen),
+                 patch('workers.kimi.verified_model_profiles',return_value=kimi))
+        for item in patches:
+            item.start();self.addCleanup(item.stop)
+
+    def test_settings_api_exposes_safe_model_catalog(self):
+        self.install_model_discovery()
+        status,_,body=self.request('GET','/api/v1/settings')
+        self.assertEqual(status,200)
+        models=json.loads(body)['models']
+        self.assertEqual(sorted(models),['kimi','qwen'])
+        self.assertEqual(models['qwen']['selected'],'qwen3.8-max')
+        self.assertEqual(models['kimi']['selected'],'kimi-code/k3')
+        self.assertEqual([o['id'] for o in models['qwen']['available']],['qwen3.8-max','qwen3.8-flash'])
+        self.assertEqual([o['id'] for o in models['kimi']['available']],['kimi-code/k3','kimi-code/k3-256k'])
+        for worker in ('qwen','kimi'):
+            self.assertEqual(sorted(models[worker]),['available','selected'])
+            for option in models[worker]['available']:
+                self.assertEqual(sorted(option),['context_window','display_name','id'])
+        # IDs/display/context metadata only: no endpoints, hosts, keys, or credentials.
+        for forbidden in (b'token-plan',b'dashscope',b'api.kimi.com',b'baseUrl',b'base_url',
+                          b'apiKey',b'DASHSCOPE',b'api_key'):
+            self.assertNotIn(forbidden,body)
+
+    def test_model_catalog_falls_back_to_reviewed_defaults(self):
+        with patch('workers.qwen.verified_model_profiles',side_effect=RuntimeError('unavailable')), \
+             patch('workers.kimi.verified_model_profiles',side_effect=RuntimeError('unavailable')):
+            status,_,body=self.request('GET','/api/v1/settings')
+        self.assertEqual(status,200)
+        models=json.loads(body)['models']
+        self.assertEqual(models['qwen']['available'],
+                         [{'id':'qwen3.8-max','display_name':'qwen3.8-max','context_window':None}])
+        self.assertEqual(models['kimi']['available'],
+                         [{'id':'kimi-code/k3','display_name':'kimi-code/k3','context_window':None}])
+        self.assertEqual(models['qwen']['selected'],'qwen3.8-max')
+        self.assertEqual(models['kimi']['selected'],'kimi-code/k3')
+
+    def test_model_selection_roundtrip_and_persistence(self):
+        self.install_model_discovery()
+        save_settings(self.runtime,qwen_concurrency=3)
+        status,_,body=self.request('POST','/api/v1/settings/model',
+                                   body=json.dumps({'worker':'qwen','model':'qwen3.8-flash'}),
+                                   headers=self.csrf_headers())
+        self.assertEqual(status,200,body)
+        payload=json.loads(body)
+        self.assertEqual(payload['status'],'saved')
+        self.assertEqual(payload['worker'],'qwen')
+        # The response is operational metadata only: no settings file paths,
+        # endpoints, or credential material.
+        self.assertEqual(sorted(payload),['models','note','status','worker'])
+        self.assertEqual(payload['models']['qwen']['selected'],'qwen3.8-flash')
+        self.assertEqual(payload['models']['kimi']['selected'],'kimi-code/k3')
+        for forbidden in (b'token-plan',b'api.kimi.com',b'apiKey',b'DASHSCOPE'):
+            self.assertNotIn(forbidden,body)
+        # Persisted through the shared settings path: user-private 0600 file,
+        # and other saved settings are preserved.
+        self.assertEqual(load_worker_model_profile(self.runtime,'qwen'),'qwen3.8-flash')
+        self.assertEqual(load_worker_model_profile(self.runtime,'kimi'),'kimi-code/k3')
+        self.assertEqual(load_worker_concurrency(self.runtime,'qwen'),3)
+        self.assertEqual(stat.S_IMODE(settings_path(self.runtime).stat().st_mode),0o600)
+        status,_,body=self.request('GET','/api/v1/settings')
+        self.assertEqual(status,200)
+        settings=json.loads(body)
+        self.assertEqual(settings['models']['qwen']['selected'],'qwen3.8-flash')
+        self.assertEqual(settings['concurrency'],{'qwen':3,'kimi':1})
+        # Switching back to the reviewed default works too.
+        status,_,_=self.request('POST','/api/v1/settings/model',
+                                body=json.dumps({'worker':'qwen','model':'qwen3.8-max'}),
+                                headers=self.csrf_headers())
+        self.assertEqual(status,200)
+        self.assertEqual(load_worker_model_profile(self.runtime,'qwen'),'qwen3.8-max')
+
+    def test_model_selection_rejects_invalid_ids_and_workers_without_writing(self):
+        self.install_model_discovery()
+        cases=({'worker':'qwen','model':'qwen3.7-max'},        # not a verified profile
+               {'worker':'qwen','model':'gpt-5'},
+               {'worker':'qwen','model':''},
+               {'worker':'qwen','model':'https://evil.example/v1'},
+               {'worker':'qwen','model':'bad id'},
+               {'worker':'qwen','model':None},
+               {'worker':'qwen','model':5},
+               {'worker':'qwen','model':True},
+               {'worker':'qwen'},                             # missing model
+               {'worker':'kimi','model':'qwen3.8-flash'},     # wrong worker's profile
+               {'worker':'kimi','model':'kimi-code/unknown'},
+               {'worker':'claude','model':'qwen3.8-max'},
+               {'worker':'other','model':'qwen3.8-max'},
+               {'model':'qwen3.8-max'},
+               {})
+        for payload in cases:
+            with self.subTest(payload=payload):
+                status,_,body=self.request('POST','/api/v1/settings/model',
+                                           body=json.dumps(payload),headers=self.csrf_headers())
+                self.assertEqual(status,400,body)
+                self.assertEqual(json.loads(body)['error']['code'],'INVALID_REQUEST')
+        # Nothing was written and defaults still apply.
+        self.assertFalse(settings_path(self.runtime).exists())
+        self.assertEqual(load_worker_model_profile(self.runtime,'qwen'),'qwen3.8-max')
+        self.assertEqual(load_worker_model_profile(self.runtime,'kimi'),'kimi-code/k3')
+        self.assertEqual(self.request('POST','/api/v1/settings/model',body='{nope',
+                                      headers=self.csrf_headers())[0],400)
+
+    def test_model_selection_requires_csrf_and_same_origin(self):
+        self.install_model_discovery()
+        body=json.dumps({'worker':'kimi','model':'kimi-code/k3-256k'})
+        headers=self.csrf_headers();headers['X-AI-Worker-CSRF']='wrong'
+        self.assertEqual(self.request('POST','/api/v1/settings/model',body=body,headers=headers)[0],403)
+        headers=self.csrf_headers(origin='http://attacker.example')
+        self.assertEqual(self.request('POST','/api/v1/settings/model',body=body,headers=headers)[0],403)
+        headers=self.csrf_headers();headers['Sec-Fetch-Site']='cross-site'
+        self.assertEqual(self.request('POST','/api/v1/settings/model',body=body,headers=headers)[0],403)
+        # Rejected requests never write, and the endpoint is POST-only.
+        self.assertFalse(settings_path(self.runtime).exists())
+        self.assertEqual(self.request('GET','/api/v1/settings/model')[0],404)
+
+    def test_static_settings_page_exposes_verified_model_selectors(self):
+        js=(Path(__file__).resolve().parents[1]/'dashboard/static/app.js').read_text(encoding='utf-8')
+        self.assertIn('MODEL PROFILES',js)
+        self.assertIn('Only locally verified provider model profiles are listed',js)
+        self.assertIn('Endpoint and credential changes are not exposed or possible here',js)
+        self.assertIn("dataset.action='save-model'",js)
+        self.assertIn("post('/api/v1/settings/model',{worker:worker,model:select.value})",js)
+        self.assertIn('model-${worker}',js)
+        self.assertIn('data.models',js)
+        # Success refreshes the page while preserving scroll; errors use flash.
+        self.assertIn('rerenderKeepingScroll(settingsPage)',js)
+        # Existing sections and XSS-safe rendering are preserved.
+        self.assertIn('WORKER CONCURRENCY',js)
+        self.assertIn('RETENTION CLEANUP',js)
+        self.assertIn('textContent',js);self.assertNotIn('innerHTML',js)
+        status,_,body=self.request('GET','/static/app.js')
+        self.assertEqual(status,200);self.assertIn(b'save-model',body)
+        status,_,body=self.request('GET','/static/dashboard.css')
+        self.assertEqual(status,200);self.assertIn(b'setting-row',body)
 
     def test_static_settings_page_exposes_bounded_concurrency_controls(self):
         js = (Path(__file__).resolve().parents[1]/'dashboard/static/app.js').read_text(encoding='utf-8')

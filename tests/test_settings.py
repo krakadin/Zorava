@@ -13,8 +13,10 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from ai_router.settings import (DEFAULT_KIMI_CONCURRENCY, DEFAULT_QWEN_CODING_BUDGET,
-                                DEFAULT_QWEN_CONCURRENCY, MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT,
+from ai_router.settings import (DEFAULT_KIMI_CONCURRENCY, DEFAULT_KIMI_MODEL_PROFILE,
+                                DEFAULT_QWEN_CODING_BUDGET,
+                                DEFAULT_QWEN_CONCURRENCY, DEFAULT_QWEN_MODEL_PROFILE,
+                                MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT,
                                 SETTINGS_FIELDS, UNLIMITED_TOOL_CALLS, SettingsError,
                                 load_qwen_coding_budget, load_settings, load_worker_concurrency,
                                 parse_budget_token, parse_concurrency_token,
@@ -51,7 +53,9 @@ class SettingsModuleTests(unittest.TestCase):
         self.assertEqual(load_settings(self.runtime),
                          {'qwen_coding_max_tool_calls': UNLIMITED_TOOL_CALLS,
                           'qwen_concurrency': DEFAULT_QWEN_CONCURRENCY,
-                          'kimi_concurrency': DEFAULT_KIMI_CONCURRENCY})
+                          'kimi_concurrency': DEFAULT_KIMI_CONCURRENCY,
+                          'qwen_model_profile': DEFAULT_QWEN_MODEL_PROFILE,
+                          'kimi_model_profile': DEFAULT_KIMI_MODEL_PROFILE})
         self.assertEqual(load_qwen_coding_budget(self.runtime), UNLIMITED_TOOL_CALLS)
 
     def test_default_concurrency_is_two_for_qwen_and_one_for_kimi(self):
@@ -342,6 +346,38 @@ class SettingsCliTests(unittest.TestCase):
                     self.assertEqual(code, 2)
                     self.assertEqual(value['error']['code'], 'INVALID_REQUEST')
         self.assertFalse(settings_path(self.runtime).exists())
+
+    def test_model_profile_set_show_and_validation(self):
+        profiles = [{'id': 'qwen3.8-max'}, {'id': 'qwen3.8-flash'}]
+        kimi_profiles = [{'id': 'kimi-code/k3'}, {'id': 'kimi-code/k3-256k'}]
+        with patch('workers.qwen.verified_model_profiles', return_value=profiles), \
+             patch('workers.kimi.verified_model_profiles', return_value=kimi_profiles):
+            code, value = self.invoke(self.worker.command_settings_show)
+            self.assertEqual(code, 0)
+            self.assertEqual(value['settings']['qwen_model_profile'], 'qwen3.8-max')
+            self.assertEqual(value['settings']['kimi_model_profile'], 'kimi-code/k3')
+            code, value = self.invoke(self.worker.command_settings_set,
+                                      key='qwen-model', value='qwen3.8-flash')
+            self.assertEqual(code, 0)
+            self.assertEqual(value['settings']['qwen_model_profile'], 'qwen3.8-flash')
+            # Setting one key never disturbs another saved key.
+            self.assertEqual(value['settings']['kimi_model_profile'], 'kimi-code/k3')
+            code, value = self.invoke(self.worker.command_settings_set,
+                                      key='kimi-model', value='kimi-code/k3-256k')
+            self.assertEqual(code, 0)
+            self.assertEqual(value['settings']['kimi_model_profile'], 'kimi-code/k3-256k')
+            # Unverified or foreign model IDs are rejected without writing.
+            for key, token in (('qwen-model', 'gpt-5'), ('qwen-model', 'qwen3.7-max'),
+                               ('kimi-model', 'qwen3.8-flash'), ('qwen-model', 'bad id')):
+                with self.subTest(key=key, token=token):
+                    code, value = self.invoke(self.worker.command_settings_set,
+                                              key=key, value=token)
+                    self.assertEqual(code, 2)
+                    self.assertEqual(value['error']['code'], 'INVALID_REQUEST')
+        # The rejected writes left the saved selections untouched.
+        code, value = self.invoke(self.worker.command_settings_show)
+        self.assertEqual(value['settings']['qwen_model_profile'], 'qwen3.8-flash')
+        self.assertEqual(value['settings']['kimi_model_profile'], 'kimi-code/k3-256k')
 
     def test_delegate_parses_max_tool_calls_flag(self):
         parser = self.worker.make_parser()

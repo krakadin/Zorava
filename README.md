@@ -72,6 +72,21 @@ ai-worker settings set kimi-concurrency 1        # Kimi slots, 1-4 (default: 1)
 
 Capacity changes apply to future jobs only and are stored in the same private `settings.json`; a settings file saved before these fields existed keeps working with the defaults above. Concurrency can also be changed from the dashboard: **Dashboard → Settings → Worker concurrency** offers the same 1–4 selectors with a Save control per worker, validated and persisted through the same private `settings.json` write as the CLI.
 
+### Model profiles
+
+Each worker has a saved model profile selection (IDs only — never endpoints or credentials), defaulting to the reviewed profiles `qwen3.8-max` (Qwen) and `kimi-code/k3` (Kimi). Selections are validated against a worker-specific verified allowlist before they are saved, and the adapter re-verifies the selected profile/endpoint pairing when a job or provider test starts:
+
+- **Qwen**: only model profiles whose Qwen-owned provider entry uses the exact reviewed Token Plan endpoint are selectable. DashScope pay-as-you-go entries are never offered from the Token Plan credential.
+- **Kimi**: only aliases present in Kimi's own private `config.toml` under the managed Kimi Code provider at its expected endpoint are selectable. If discovery is unavailable, only the reviewed `kimi-code/k3` default remains.
+
+```bash
+ai-worker settings show                            # shows budget, capacity, and model profiles
+ai-worker settings set qwen-model qwen3.8-max      # a verified Qwen Token Plan profile ID
+ai-worker settings set kimi-model kimi-code/k3     # a verified managed Kimi Code alias
+```
+
+Changes apply to future jobs and provider tests only and live in the same private `settings.json`. The dashboard offers the same verified selectors at **Dashboard → Settings → Model profiles**; endpoints and credentials are never shown or editable there.
+
 Claude integration instructions are installed at `~/.claude/skills/delegate-workers/SKILL.md`. Start or restart Claude Code after updating the skill. Claude remains responsible for checking worker findings and responding. A Claude Bash/tool timeout must exceed the worker timeout, which defaults to 1800 seconds (30 minutes) for both Qwen and Kimi and can be lowered with `--timeout SECONDS` (accepted range 10–1800).
 
 ## Commands
@@ -84,10 +99,12 @@ ai-worker test kimi [--json]
 ai-worker delegate qwen --cwd PATH [--timeout SECONDS] [--max-tool-calls unlimited|N] [--json]  # isolated coding; task from stdin
 ai-worker delegate kimi --cwd PATH [--timeout SECONDS] [--json]  # isolated coding; task from stdin
 ai-worker delegate qwen|kimi --cwd PATH --mode read-only --json # analysis without edits
-ai-worker settings show                                # saved budget and slot capacity defaults
+ai-worker settings show                                # saved budget, slot capacity, and model profiles
 ai-worker settings set qwen-coding-budget unlimited|N  # save default for future Qwen coding jobs
 ai-worker settings set qwen-concurrency 1-4            # simultaneous Qwen jobs (default: 2)
 ai-worker settings set kimi-concurrency 1-4            # simultaneous Kimi jobs (default: 1)
+ai-worker settings set qwen-model PROFILE_ID           # verified Qwen Token Plan profile (default: qwen3.8-max)
+ai-worker settings set kimi-model PROFILE_ID           # verified managed Kimi Code alias (default: kimi-code/k3)
 ai-worker diff JOB_UUID [--json]
 ai-worker discard JOB_UUID --confirm
 ai-worker run [--json]  # structured request from stdin
@@ -100,7 +117,7 @@ ai-worker cleanup --dry-run          # preview expired local records (default)
 ai-worker cleanup --confirm          # purge eligible terminal records after review
 ```
 
-The Zorava dashboard has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It shows safe provider/model/endpoint metadata, supports fixed small Qwen/Kimi smoke tests, cancellation, per-worker concurrency changes (1–4, same validation as the CLI), and a two-step retention purge. It accepts no arbitrary worker prompt or shell command. Refreshes do not contact providers. Provider cards show the installed CLI version plus cached update metadata; `Check for upgrades` is an explicit, read-only comparison against that CLI's fixed official version source, and a pending upgrade is only labeled, never installed. Test buttons track the new job through completion, display its completion timestamp and the last successful test, and refresh their action token after dashboard restarts. Model and endpoint edits are intentionally not available in the UI; only the locally verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. Do not enter credentials into ai-router.
+The Zorava dashboard has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It shows safe provider/model/endpoint metadata, supports fixed small Qwen/Kimi smoke tests, cancellation, per-worker concurrency changes (1–4, same validation as the CLI), and a two-step retention purge. It accepts no arbitrary worker prompt or shell command. Refreshes do not contact providers. Provider cards show the installed CLI version plus cached update metadata; `Check for upgrades` is an explicit, read-only comparison against that CLI's fixed official version source, and a pending upgrade is only labeled, never installed. Test buttons track the new job through completion, display its completion timestamp and the last successful test, and refresh their action token after dashboard restarts. Model profiles can be selected on the Settings page, but only from the locally verified allowlists (Qwen Token Plan profiles on the reviewed endpoint; managed Kimi Code aliases); endpoint and credential edits are intentionally not available in the UI. Do not enter credentials into ai-router.
 
 Local job records use a 30-day retention period. The default cleanup is a dry run. It protects active jobs and retained isolated-edit worktrees/runtime data and never deletes Qwen/Kimi provider histories. Purging records is not guaranteed secure erasure on SSDs or snapshot-backed filesystems.
 

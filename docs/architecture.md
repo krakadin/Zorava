@@ -17,6 +17,8 @@ The project has no provider proxy. Claude's Anthropic traffic does not pass thro
 
 Qwen's adapter verifies that the current active model is `qwen3.8-max` and that both configured base URLs use `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`. It reports only endpoint hostname and credential presence; the key remains in Qwen's settings and is neither inherited nor copied by ai-router. Its requested model is explicit. No fallback model, alternate endpoint, scheduler, background worker service, or unattended/bulk path exists.
 
+Each worker's requested model comes from a saved model profile selection in the private `settings.json` (IDs only; defaults `qwen3.8-max` and `kimi-code/k3`). A selection is accepted only from the worker's verified allowlist: Qwen profiles must have a Qwen-owned provider entry on the exact reviewed Token Plan endpoint, and Kimi profiles must be aliases under the managed Kimi Code provider at its expected endpoint in Kimi's own private config. The supervisor applies the saved profile before the job snapshot is recorded, and the adapter re-verifies the profile/endpoint pairing when building the launch command or provider test, failing closed on any mismatch.
+
 ## Coding and read-only invocation
 
 `ai-worker delegate qwen|kimi --cwd PATH --json` reads the task from stdin and defaults to coding in a separate Git worktree. Both adapters share worktree creation, the scoped file broker, diff collection, and cleanup in `workers/workspace.py`. The parent reviews the returned diff; the primary checkout is not automatically changed. Use `--mode read-only` to select the analysis path described below. The supervisor validates UTF-8, payload size, timeout, worker, mode, and canonical working-directory containment beneath `/home/krakadin/myDev`.
@@ -47,7 +49,7 @@ On completion, ai-worker returns the worktree location and a bounded sanitized d
 
 `ai-worker dashboard` starts a standard-library HTTP server on `127.0.0.1:8787`. It reads the same SQLite job state and invokes only predefined provider-test, cancellation, and retention actions. It does not accept arbitrary prompts, expose a shell, or serve arbitrary filesystem paths. It is not required for synchronous Claude delegation; no daemon or systemd service is required.
 
-The UI shows safe provider configuration metadata, cached health, jobs, sanitized event logs, permission summaries, and retention settings. Model and endpoint changes are not exposed as form inputs. Only the locally verified Qwen Token Plan and Kimi Code K3 profiles are enabled. Add/switch models only through a separately verified configuration change; credentials remain provider-owned.
+The UI shows safe provider configuration metadata, cached health, jobs, sanitized event logs, permission summaries, and retention settings. Endpoint and credential changes are never exposed as form inputs. Model profiles can be selected on the Settings page, but only from the locally verified allowlists (Qwen Token Plan profiles on the reviewed endpoint; managed Kimi Code aliases); any other model requires a separately verified configuration change, and credentials remain provider-owned.
 
 Local job records have 30-day retention. `ai-worker cleanup --dry-run` previews eligible records and `ai-worker cleanup --confirm` removes eligible terminal job/event rows. Active jobs and retained Kimi worktree/session directories are protected. Native provider histories remain provider-owned. ACP, persistent sessions, and OS-level read confinement remain future work.
 

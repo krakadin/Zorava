@@ -29,16 +29,18 @@ ai-worker show JOB_UUID
 ai-worker diff JOB_UUID --json
 ai-worker cancel JOB_UUID            # works for running jobs and queued jobs waiting for a slot
 ai-worker discard JOB_UUID --confirm  # permanently removes this job's isolated worktree/history
-ai-worker settings show                       # saved budget and per-worker slot capacity
+ai-worker settings show                       # saved budget, slot capacity, and model profiles
 ai-worker settings set qwen-concurrency 1-4   # simultaneous Qwen jobs (default: 2)
 ai-worker settings set kimi-concurrency 1-4   # simultaneous Kimi jobs (default: 1)
+ai-worker settings set qwen-model PROFILE_ID  # verified Qwen Token Plan profile (default: qwen3.8-max)
+ai-worker settings set kimi-model PROFILE_ID  # verified managed Kimi Code alias (default: kimi-code/k3)
 ```
 
 Each worker runs up to its configured slot capacity concurrently (cross-process flock slot locks under `~/.local/state/ai-workers/locks`). Jobs beyond capacity wait in `queued` state and start when a slot frees; cancelling a queued job marks it `cancelled` without ever starting a worker process. Capacity changes apply only to future jobs and can also be made from Dashboard → Settings → Worker concurrency (same 1–4 validation and private settings.json write). The dashboard Settings and provider cards show capacity plus live queued/running counts.
 
 The dashboard is loopback-only and has Overview, Jobs, Providers, Permissions, Logs, and Settings views. It supports fixed small provider tests, cancellation, filtering history, a two-step retention purge, and an explicit read-only CLI version check. It accepts no arbitrary worker task and exposes no shell endpoint. Provider tests are live provider calls; page refreshes use cached/local state only. Start it with `ai-worker dashboard`; Ctrl+C stops the dashboard.
 
-Provider cards show the configured model/backend and safe endpoint metadata. The UI intentionally does not change model URLs or accept credentials. Only the currently verified Qwen Token Plan (`qwen3.8-max`) and Kimi Code (`kimi-code/k3`) profiles are enabled. A different model requires a separately verified configuration change. Never put a provider token in ai-router.
+Provider cards show the configured model/backend and safe endpoint metadata. The UI never changes model URLs or accepts credentials. Model selection is limited to locally verified profiles on the Settings page (Dashboard → Settings → Model profiles) or `ai-worker settings set qwen-model|kimi-model`: Qwen profiles must come from a Qwen-owned provider entry on the exact reviewed Token Plan endpoint (pay-as-you-go DashScope entries are excluded), and Kimi profiles must be aliases from the managed Kimi Code provider in Kimi's own private config. Only profile IDs are stored in the private `settings.json`; the adapter re-verifies the profile/endpoint pairing at job and provider-test start and fails closed (`CONFIG_ERROR`) if a saved profile is no longer verifiable. If discovery is unavailable, only the reviewed defaults (`qwen3.8-max`, `kimi-code/k3`) remain selectable. Any other model requires a separately verified configuration change. Never put a provider token in ai-router.
 
 Retention is 30 days for terminal ai-router jobs/results/events. The default cleanup previews; `--confirm` purges eligible records. Active jobs and per-job directories containing retained isolated-edit worktrees/session history are protected. Provider CLI histories/settings are never touched. Deletion is not guaranteed secure erasure, especially on SSDs or snapshot-backed filesystems.
 

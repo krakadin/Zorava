@@ -20,7 +20,8 @@ from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT
 from ai_router.landlock import LandlockUnavailable, landlock_abi
 from ai_router.settings import (MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS,
                                 SettingsError, load_settings, load_worker_concurrency,
-                                parse_budget_token, parse_concurrency_token, save_settings)
+                                parse_budget_token, parse_concurrency_token, save_settings,
+                                validate_model_profile_selection)
 from ai_router.state import StateStore
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.supervisor import Supervisor
@@ -454,7 +455,11 @@ def _settings_view(settings: dict) -> dict:
             'applies_to': 'qwen isolated-edit jobs without an explicit max_tool_calls',
             'qwen_concurrency': settings['qwen_concurrency'],
             'kimi_concurrency': settings['kimi_concurrency'],
-            'concurrency_note': 'Jobs beyond capacity wait queued and start when a slot frees.'}
+            'concurrency_note': 'Jobs beyond capacity wait queued and start when a slot frees.',
+            'qwen_model_profile': settings['qwen_model_profile'],
+            'kimi_model_profile': settings['kimi_model_profile'],
+            'model_note': 'Only locally verified provider model profiles are selectable; '
+                          'endpoints and credentials stay provider-owned.'}
 
 
 def command_settings_show(args) -> int:
@@ -470,6 +475,12 @@ def command_settings_set(args) -> int:
     try:
         if args.key == 'qwen-coding-budget':
             overrides = {'qwen_coding_max_tool_calls': parse_budget_token(args.value)}
+        elif args.key in ('qwen-model', 'kimi-model'):
+            worker = args.key.split('-', 1)[0]
+            # Verified against the provider-owned configuration before writing;
+            # only locally verified model profile IDs are accepted.
+            overrides = {f'{worker}_model_profile':
+                         validate_model_profile_selection(worker, args.value)}
         else:
             overrides = {args.key.replace('-', '_'): parse_concurrency_token(args.value)}
     except SettingsError as exc:
@@ -543,13 +554,16 @@ def make_parser() -> argparse.ArgumentParser:
     dashboard.set_defaults(func=command_dashboard)
     settings_cmd = commands.add_parser('settings', help='Show or set saved local defaults (no credentials).')
     settings_sub = settings_cmd.add_subparsers(dest='settings_command', required=True)
-    settings_show = settings_sub.add_parser('show', help='Show the saved budget and concurrency defaults.')
+    settings_show = settings_sub.add_parser('show', help='Show the saved budget, concurrency, and model profile defaults.')
     settings_show.add_argument('--json', action='store_true')
     settings_show.set_defaults(func=command_settings_show)
-    settings_set = settings_sub.add_parser('set', help='Save a local default (budget or worker concurrency).')
-    settings_set.add_argument('key', choices=('qwen-coding-budget', 'qwen-concurrency', 'kimi-concurrency'))
+    settings_set = settings_sub.add_parser('set', help='Save a local default (budget, worker concurrency, or verified model profile).')
+    settings_set.add_argument('key', choices=('qwen-coding-budget', 'qwen-concurrency', 'kimi-concurrency',
+                                              'qwen-model', 'kimi-model'))
     settings_set.add_argument('value', help="qwen-coding-budget: 'unlimited' or 0-%d; "
-                              "qwen-concurrency/kimi-concurrency: 1-%d." % (MAX_TOOL_CALLS_LIMIT, MAX_CONCURRENCY))
+                              "qwen-concurrency/kimi-concurrency: 1-%d; "
+                              "qwen-model/kimi-model: a locally verified model profile ID."
+                              % (MAX_TOOL_CALLS_LIMIT, MAX_CONCURRENCY))
     settings_set.add_argument('--json', action='store_true')
     settings_set.set_defaults(func=command_settings_set)
     return parser

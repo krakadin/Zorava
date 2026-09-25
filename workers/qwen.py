@@ -24,6 +24,45 @@ QWEN_PROVIDER = 'Alibaba Model Studio Token Plan'
 QWEN_PROFILE = Path(__file__).resolve().parent.parent / 'profiles' / 'qwen-researcher.md'
 _VERSION = re.compile(r'(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
 
+
+def verified_model_profiles(settings_path: Path = QWEN_SETTINGS) -> list[dict]:
+    """Model profiles whose Qwen-owned provider entry uses the exact reviewed
+    Token Plan endpoint.
+
+    Reads Qwen's own private settings and returns IDs/display metadata only.
+    Entries on any other endpoint (for example DashScope pay-as-you-go) and
+    all credential fields are excluded; the endpoint and key stay Qwen-owned.
+    Raises WorkerSetupError when the configuration cannot be read safely.
+    """
+    path = Path(settings_path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError
+        info = path.stat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
+            raise WorkerSetupError('CONFIG_ERROR', 'Qwen settings must be user-owned and private.')
+        settings = json.loads(path.read_text(encoding='utf-8'))
+    except WorkerSetupError:
+        raise
+    except (OSError, UnicodeError, ValueError):
+        raise WorkerSetupError('CONFIG_ERROR', 'Qwen settings could not be validated safely.') from None
+    providers = settings.get('modelProviders') if isinstance(settings, dict) else None
+    openai = providers.get('openai') if isinstance(providers, dict) else None
+    profiles = []
+    seen = set()
+    if isinstance(openai, list):
+        for entry in openai:
+            if not isinstance(entry, dict) or entry.get('baseUrl') != QWEN_TOKEN_PLAN_URL:
+                continue
+            profile_id = entry.get('id')
+            if not isinstance(profile_id, str) or not profile_id or profile_id in seen:
+                continue
+            seen.add(profile_id)
+            context = entry.get('contextWindow', entry.get('context_window'))
+            profiles.append({'id': profile_id, 'display_name': profile_id,
+                             'context_window': context if type(context) is int and context > 0 else None})
+    return profiles
+
 # The built-in filesystem readers are the only tools allow-listed. The deny
 # list is defense in depth for tools that are synthetic, deferred, or outside
 # the core-tools allowlist semantics of this Qwen Code release.
@@ -152,8 +191,32 @@ class QwenAdapter(IsolatedWorkspace):
                 'base_url': QWEN_TOKEN_PLAN_URL, 'cli_model': QWEN_MODEL,
                 'credential_present': credential_present}
 
+    def select_model_profile(self, profile_id: str | None) -> None:
+        """Select a verified Token Plan model profile for subsequent commands.
+
+        Only IDs whose Qwen-owned provider entry uses the exact reviewed Token
+        Plan endpoint are accepted; endpoints and credentials stay Qwen-owned.
+        """
+        candidate = profile_id or QWEN_MODEL
+        available = {profile['id'] for profile in verified_model_profiles(self.settings_path)}
+        if candidate not in available:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Selected Qwen model is not a verified Token Plan profile.')
+        self.requested_model = candidate
+
+    def _verify_selected_model(self) -> None:
+        """Re-validate the selected model/endpoint pairing immediately before launch."""
+        if self.requested_model == QWEN_MODEL:
+            # configuration_info() already verified the reviewed default pairing.
+            return
+        available = {profile['id'] for profile in verified_model_profiles(self.settings_path)}
+        if self.requested_model not in available:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Selected Qwen model is not paired with the reviewed Token Plan endpoint.')
+
     def build_command(self, request: WorkerRequest, job_id: str) -> list[str]:
         self.configuration_info()
+        self._verify_selected_model()
         if request.mode == 'isolated-edit':
             with self._dirs_lock:
                 job_dir = self._job_dirs.get(job_id)

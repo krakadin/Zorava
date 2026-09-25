@@ -24,7 +24,9 @@ sys.path.insert(0, str(PROJECT))
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.settings import (SETTINGS_FIELDS, SettingsError, load_worker_concurrency,
-                                save_settings, validate_concurrency)
+                                load_worker_model_profile, save_settings,
+                                validate_concurrency, validate_model_profile_selection,
+                                verified_model_catalog)
 from ai_router.security import redact
 from ai_router.state import StateStore
 from ai_router.supervisor import Supervisor
@@ -103,6 +105,27 @@ class DashboardController:
             return load_worker_concurrency(self.runtime, name)
         except SettingsError:
             return SETTINGS_FIELDS[f'{name}_concurrency']['default']
+
+    def model_catalog(self) -> dict:
+        """Read-only safe model catalog: selected ID plus allowlisted options.
+
+        Options carry ID/display name/context metadata only -- never URLs,
+        keys, or credential fields. Discovery failure falls back to each
+        worker's single reviewed default profile.
+        """
+        catalog = {}
+        for name in ('qwen', 'kimi'):
+            default = SETTINGS_FIELDS[f'{name}_model_profile']['default']
+            try:
+                selected = load_worker_model_profile(self.runtime, name)
+            except SettingsError:
+                selected = default
+            try:
+                options = verified_model_catalog(name)
+            except Exception:
+                options = [{'id': default, 'display_name': default, 'context_window': None}]
+            catalog[name] = {'selected': selected, 'available': options}
+        return catalog
 
     def providers(self):
         if self.provider_snapshot is None:
@@ -462,6 +485,7 @@ def make_handler(controller: DashboardController):
                                 'max_timeout_seconds':MAX_TIMEOUT,
                                 'concurrency':{'qwen':controller._worker_concurrency('qwen'),'kimi':controller._worker_concurrency('kimi')},
                                 'concurrency_limits':{'minimum':1,'maximum':SETTINGS_FIELDS['qwen_concurrency']['maximum']},
+                                'models':controller.model_catalog(),
                                 'default_mode':'isolated-edit','retention_days':DEFAULT_RETENTION_DAYS,
                                 'dashboard_bind':'127.0.0.1','dashboard_port':controller.port,
                                 'runtime_state':str(controller.runtime),'model_changes':'Use only locally verified provider model profiles; this dashboard does not edit provider URLs or credentials.'})
@@ -544,6 +568,29 @@ def make_handler(controller: DashboardController):
                                 'concurrency_limits':{'minimum':1,'maximum':maximum},
                                 'note':f"{worker.capitalize()} concurrency is now {concurrency[worker]} "
                                         f"(allowed 1-{maximum}); extra jobs wait queued for a free slot. "
+                                        f"Applies to future jobs only."})
+                    return
+                if path == '/api/v1/settings/model':
+                    # Select one allowlisted, locally verified model profile.
+                    # IDs only: endpoints and credentials are never accepted,
+                    # shown, or stored here. Invalid, unknown, or unverifiable
+                    # IDs are rejected and never write settings.
+                    worker = body.get('worker')
+                    if worker not in ('qwen','kimi'):
+                        return self._error(400,'INVALID_REQUEST','Worker must be qwen or kimi.')
+                    try:
+                        selected = validate_model_profile_selection(worker, body.get('model'))
+                    except SettingsError as exc:
+                        return self._error(400,'INVALID_REQUEST',str(exc))
+                    try:
+                        save_settings(controller.runtime, **{f'{worker}_model_profile': selected})
+                    except SettingsError:
+                        # Unsafe/malformed existing config or runtime directory;
+                        # nothing was overwritten and no detail is exposed.
+                        return self._error(500,'LOCAL_ACTION_FAILED','The requested local action failed safely.')
+                    self._json({'status':'saved','worker':worker,'models':controller.model_catalog(),
+                                'note':f"{worker.capitalize()} model profile is now {selected}. Only verified "
+                                        f"local profiles are selectable; endpoints and credentials are unchanged. "
                                         f"Applies to future jobs only."})
                     return
                 if path.startswith('/api/v1/jobs/') and path.endswith('/cancel'):

@@ -10,6 +10,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import tomllib
 
 from ai_router.request import WorkerRequest
 from .base import ParsedOutput, WorkerSetupError, common_child_environment
@@ -17,11 +18,71 @@ from .workspace import IsolatedWorkspace
 
 
 KIMI_EXECUTABLE = Path('/home/krakadin/.kimi-code/bin/kimi')
+KIMI_CONFIG = Path('/home/krakadin/.kimi-code/config.toml')
 KIMI_MODEL = 'kimi-code/k3'
 KIMI_API_MODEL = 'k3'
 KIMI_PROVIDER = 'Kimi Code'
 KIMI_ENDPOINT_HOST = 'api.kimi.com'
+KIMI_CODE_BASE_URL = 'https://api.kimi.com/coding/v1'
 _VERSION = re.compile(r'(?<!\d)(\d+\.\d+\.\d+)(?!\d)')
+
+
+def verified_model_profiles(config_path: Path = KIMI_CONFIG) -> list[dict]:
+    """Model aliases under the managed Kimi Code provider at its expected endpoint.
+
+    Reads only Kimi's own private config.toml. Aliases bound to any other
+    provider entry, to a provider with a static API key, or to an unexpected
+    endpoint are excluded. Aliases/display metadata only; no URLs or keys are
+    returned. Raises WorkerSetupError when the configuration cannot be read
+    or parsed safely.
+    """
+    path = Path(config_path)
+    try:
+        if path.is_symlink() or not path.is_file():
+            raise ValueError
+        info = path.stat()
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Kimi config must be user-owned and not group/world writable.')
+        raw = path.read_bytes()
+    except WorkerSetupError:
+        raise
+    except (OSError, ValueError):
+        raise WorkerSetupError('CONFIG_ERROR', 'Kimi config could not be validated safely.') from None
+    if len(raw) > 1024 * 1024:
+        raise WorkerSetupError('CONFIG_ERROR', 'Kimi config is unexpectedly large.')
+    try:
+        data = tomllib.loads(raw.decode('utf-8'))
+    except (UnicodeError, ValueError):
+        raise WorkerSetupError('CONFIG_ERROR', 'Kimi config could not be parsed safely.') from None
+    providers = data.get('providers') if isinstance(data, dict) else None
+    managed = set()
+    if isinstance(providers, dict):
+        for name, entry in providers.items():
+            if not isinstance(name, str) or not isinstance(entry, dict):
+                continue
+            implementation = entry.get('type', entry.get('implementation'))
+            managed_type = isinstance(implementation, str) and (
+                implementation == 'kimi' or implementation.startswith('managed:kimi'))
+            if (managed_type and entry.get('base_url') == KIMI_CODE_BASE_URL
+                    and not entry.get('api_key')):
+                managed.add(name)
+    profiles = []
+    models = data.get('models') if isinstance(data, dict) else None
+    if isinstance(models, dict):
+        for model_id, entry in models.items():
+            if not isinstance(model_id, str) or not isinstance(entry, dict):
+                continue
+            provider = entry.get('provider')
+            if provider is None and '/' in model_id:
+                provider = model_id.split('/', 1)[0]
+            if provider not in managed:
+                continue
+            alias = model_id if '/' in model_id else f'{provider}/{model_id}'
+            context = entry.get('max_context_size', entry.get('context_window'))
+            profiles.append({'id': alias, 'display_name': alias,
+                             'context_window': context if type(context) is int and context > 0 else None})
+    return profiles
 
 
 class KimiAdapter(IsolatedWorkspace):
@@ -30,11 +91,40 @@ class KimiAdapter(IsolatedWorkspace):
     requested_model = KIMI_MODEL
 
     def __init__(self, runtime_tmp: Path, profile: Path | None = None,
-                 executable: Path = KIMI_EXECUTABLE):
+                 executable: Path = KIMI_EXECUTABLE, config_path: Path = KIMI_CONFIG):
         self._init_workspace(runtime_tmp)
         self.profile = profile or Path(__file__).resolve().parent.parent / 'profiles' / 'kimi-coder.md'
         self.editor_profile = self.profile.with_name('kimi-editor.md')
         self.executable = executable
+        self.config_path = config_path
+
+    def select_model_profile(self, profile_id: str | None) -> None:
+        """Select a verified managed Kimi Code model alias for subsequent commands.
+
+        Only aliases present in Kimi's own config under the managed Kimi Code
+        provider at its expected endpoint are accepted. The reviewed default
+        alias remains selectable when discovery is unavailable; other aliases
+        require positive verification.
+        """
+        candidate = profile_id or KIMI_MODEL
+        if candidate == KIMI_MODEL:
+            self.requested_model = KIMI_MODEL
+            return
+        available = {profile['id'] for profile in verified_model_profiles(self.config_path)}
+        if candidate not in available:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Selected Kimi model is not a verified managed Kimi Code profile.')
+        self.requested_model = candidate
+
+    def _verify_selected_model(self) -> None:
+        """Re-validate a non-default selected alias immediately before launch."""
+        if self.requested_model == KIMI_MODEL:
+            return
+        available = {profile['id'] for profile in verified_model_profiles(self.config_path)}
+        if self.requested_model not in available:
+            raise WorkerSetupError('CONFIG_ERROR',
+                                   'Selected Kimi model is not paired with the expected Kimi Code '
+                                   'provider/endpoint.')
 
     def _prepare_editor(self, job_dir: Path, worktree: Path) -> dict[str, str]:
         env = self._prepare_session_home(job_dir)
@@ -144,6 +234,7 @@ class KimiAdapter(IsolatedWorkspace):
 
     def build_command(self, request: WorkerRequest, job_id: str) -> list[str]:
         self._validate_executable()
+        self._verify_selected_model()
         if request.mode == 'isolated-edit':
             with self._dirs_lock:
                 job_dir = self._job_dirs.get(job_id)
@@ -184,6 +275,7 @@ class KimiAdapter(IsolatedWorkspace):
 
     def build_test_command(self, request: WorkerRequest, job_id: str) -> list[str]:
         self._validate_executable()
+        self._verify_selected_model()
         profile = self.profile.with_name('kimi-smoke.md')
         if profile.is_symlink() or not profile.is_file():
             raise WorkerSetupError('CONFIG_ERROR', 'Kimi smoke-test profile is missing or unsafe.')

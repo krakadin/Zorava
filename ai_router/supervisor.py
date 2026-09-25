@@ -17,7 +17,8 @@ import uuid
 
 from .request import parse_request, WorkerRequest
 from .security import MAX_TEXT, redact
-from .settings import SettingsError, load_qwen_coding_budget, load_worker_concurrency
+from .settings import (SettingsError, load_qwen_coding_budget,
+                       load_worker_concurrency, load_worker_model_profile)
 from .state import StateStore
 from workers.base import WorkerSetupError
 
@@ -89,6 +90,25 @@ class Supervisor:
             target.mkdir(mode=0o700, exist_ok=True)
             if target.is_symlink() or target.stat().st_uid != os.getuid() or (target.stat().st_mode & 0o777) != 0o700:
                 raise RuntimeError('Unsafe runtime subdirectory permissions.')
+
+    def _select_model_profile(self, adapter, worker: str) -> str | None:
+        """Apply the saved verified model profile; return an error message on failure.
+
+        The adapter validates the saved ID against its worker-specific verified
+        allowlist (provider-owned configuration), so a stale or tampered
+        selection never reaches the CLI. Adapters without profile support
+        (test fakes) keep their fixed default model.
+        """
+        select = getattr(adapter, 'select_model_profile', None)
+        if not callable(select):
+            return None
+        try:
+            select(load_worker_model_profile(self.runtime, worker))
+            return None
+        except (SettingsError, WorkerSetupError) as exc:
+            return str(exc)[:240]
+        except Exception:
+            return 'Selected model profile could not be verified safely.'
 
     @staticmethod
     def _proc_start(pid: int, expected_pgid: int) -> str | None:
@@ -172,8 +192,18 @@ class Supervisor:
                 job_id = str(uuid.UUID(job_id))
             except (ValueError, AttributeError, TypeError):
                 raise ValueError('Invalid preassigned job identifier.') from None
-        self.state.create_job(job_id,request,adapter.requested_model,adapter.role,worker_version,job_type)
         started_mono = time.monotonic()
+        selection_error = self._select_model_profile(adapter, request.worker)
+        self.state.create_job(job_id,request,adapter.requested_model,adapter.role,worker_version,job_type)
+        if selection_error is not None:
+            # The saved model profile is not currently verifiable; fail closed
+            # before any worker process or provider call is started.
+            try:
+                self.state.fail_queued(job_id,'CONFIG_ERROR',selection_error)
+            except sqlite3.Error:
+                pass
+            return self._failure(job_id,request,adapter,'failed','CONFIG_ERROR',selection_error,
+                                 None,started_mono,None,worker_version)
         started_at = None
         proc = None
         launch_request = request

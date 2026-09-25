@@ -29,6 +29,14 @@ MAX_CONCURRENCY = 4
 DEFAULT_QWEN_CONCURRENCY = 2
 DEFAULT_KIMI_CONCURRENCY = 1
 
+# Saved model profile selections store profile IDs only -- never endpoints,
+# URLs, or credentials. These defaults mirror the reviewed adapter profiles
+# (workers/qwen.py QWEN_MODEL and workers/kimi.py KIMI_MODEL) and must stay
+# in sync with them.
+DEFAULT_QWEN_MODEL_PROFILE = 'qwen3.8-max'
+DEFAULT_KIMI_MODEL_PROFILE = 'kimi-code/k3'
+MODEL_PROFILE_ID_PATTERN = re.compile(r'[A-Za-z0-9][A-Za-z0-9._/-]{0,199}')
+
 # Introspectable field schema for the CLI and the upcoming dashboard Settings
 # view. Values are validated with validate_setting before any write.
 SETTINGS_FIELDS = {
@@ -59,6 +67,24 @@ SETTINGS_FIELDS = {
         'maximum': MAX_CONCURRENCY,
         'applies_to': 'kimi jobs across all ai-worker processes',
         'description': 'Maximum simultaneous Kimi jobs; further jobs wait queued for a slot.',
+    },
+    'qwen_model_profile': {
+        'type': 'string',
+        'kind': 'model',
+        'worker': 'qwen',
+        'default': DEFAULT_QWEN_MODEL_PROFILE,
+        'applies_to': 'future qwen jobs and provider tests',
+        'description': 'Saved Qwen model profile ID; only profiles verified against the '
+                       'reviewed Token Plan endpoint are accepted.',
+    },
+    'kimi_model_profile': {
+        'type': 'string',
+        'kind': 'model',
+        'worker': 'kimi',
+        'default': DEFAULT_KIMI_MODEL_PROFILE,
+        'applies_to': 'future kimi jobs and provider tests',
+        'description': 'Saved Kimi model alias; only aliases from the managed Kimi Code '
+                       'provider configuration are accepted.',
     },
 }
 
@@ -95,12 +121,31 @@ def validate_concurrency(value) -> int:
     return value
 
 
-def validate_setting(name: str, value) -> int:
+def validate_model_profile_id(value) -> str:
+    """Structural check for a stored model profile ID (no provider I/O).
+
+    Allowlist verification against the provider-owned configuration happens
+    separately in validate_model_profile_selection before any write.
+    """
+    if not isinstance(value, str):
+        raise SettingsError('Model profile must be a string ID.', 'INVALID_REQUEST')
+    candidate = value.strip()
+    if not MODEL_PROFILE_ID_PATTERN.fullmatch(candidate):
+        raise SettingsError(
+            'Model profile must be a short alphanumeric ID (dots, dashes, underscores, '
+            'and a provider path separator are allowed).',
+            'INVALID_REQUEST')
+    return candidate
+
+
+def validate_setting(name: str, value):
     field = SETTINGS_FIELDS.get(name)
     if field is None:
         raise SettingsError(f'Unknown setting {name!r}.', 'INVALID_REQUEST')
     if field['kind'] == 'budget':
         return validate_budget(value)
+    if field['kind'] == 'model':
+        return validate_model_profile_id(value)
     return validate_concurrency(value)
 
 
@@ -180,18 +225,105 @@ def load_worker_concurrency(runtime: Path, worker: str) -> int:
     return load_settings(runtime)[f'{worker}_concurrency']
 
 
+_WORKER_MODEL_DEFAULTS = {'qwen': DEFAULT_QWEN_MODEL_PROFILE,
+                          'kimi': DEFAULT_KIMI_MODEL_PROFILE}
+
+
+def _discover_worker_model_profiles(worker: str):
+    """Verified model profiles from the worker's provider-owned configuration.
+
+    Returns None when discovery is unavailable (missing/unsafe/unparseable
+    provider config). Only safe metadata (ID, display name, context size) is
+    kept; URLs, keys, and credential fields never enter the result. Imported
+    lazily so this module never depends on the worker adapters at import time.
+    """
+    if worker == 'qwen':
+        from workers.qwen import verified_model_profiles as discover
+    elif worker == 'kimi':
+        from workers.kimi import verified_model_profiles as discover
+    else:
+        raise SettingsError(f'Unknown worker {worker!r}.', 'INVALID_REQUEST')
+    try:
+        discovered = discover()
+    except Exception:
+        return None
+    profiles = []
+    seen = set()
+    for profile in discovered or []:
+        if not isinstance(profile, dict):
+            continue
+        profile_id = profile.get('id')
+        if (not isinstance(profile_id, str)
+                or not MODEL_PROFILE_ID_PATTERN.fullmatch(profile_id)
+                or profile_id in seen):
+            continue
+        seen.add(profile_id)
+        display = profile.get('display_name')
+        context = profile.get('context_window')
+        profiles.append({
+            'id': profile_id,
+            'display_name': display.strip()[:120] if isinstance(display, str) and display.strip() else profile_id,
+            'context_window': context if type(context) is int and context > 0 else None,
+        })
+    return profiles or None
+
+
+def verified_model_catalog(worker: str) -> list:
+    """Safe model catalog for UIs: IDs, display names, and context metadata only.
+
+    When discovery is unavailable the catalog falls back to the worker's
+    single reviewed default profile.
+    """
+    profiles = _discover_worker_model_profiles(worker)
+    if profiles is not None:
+        return profiles
+    default = _WORKER_MODEL_DEFAULTS[worker]
+    return [{'id': default, 'display_name': default, 'context_window': None}]
+
+
+def validate_model_profile_selection(worker: str, value) -> str:
+    """Verify a model profile ID against the worker's verified allowlist.
+
+    Used before any settings write. When the provider-owned configuration
+    cannot be read, only the reviewed default profile remains selectable.
+    """
+    candidate = validate_model_profile_id(value)
+    profiles = _discover_worker_model_profiles(worker)
+    if profiles is None:
+        allowed = {_WORKER_MODEL_DEFAULTS[worker]}
+    else:
+        allowed = {profile['id'] for profile in profiles}
+    if candidate not in allowed:
+        raise SettingsError(
+            f'{candidate!r} is not a verified {worker} model profile; only locally '
+            'verified profiles are selectable.',
+            'INVALID_REQUEST')
+    return candidate
+
+
+def load_worker_model_profile(runtime: Path, worker: str) -> str:
+    """Saved model profile ID for one worker (reviewed default when unset)."""
+    if worker not in ('qwen', 'kimi'):
+        raise SettingsError(f'Unknown worker {worker!r}.', 'INVALID_REQUEST')
+    return load_settings(runtime)[f'{worker}_model_profile']
+
+
 def save_settings(runtime: Path, *, qwen_coding_max_tool_calls=None,
-                  qwen_concurrency=None, kimi_concurrency=None) -> dict:
+                  qwen_concurrency=None, kimi_concurrency=None,
+                  qwen_model_profile=None, kimi_model_profile=None) -> dict:
     """Atomically persist settings with 0600 permissions.
 
     Only the fields given an explicit value change; every other saved field is
-    preserved. Existing configuration is validated first; malformed or unsafe
-    files are never silently overwritten.
+    preserved. Model profile selections are validated against the worker's
+    verified allowlist before anything is written. Existing configuration is
+    validated first; malformed or unsafe files are never silently overwritten.
     """
     runtime = Path(runtime)
     overrides = {'qwen_coding_max_tool_calls': qwen_coding_max_tool_calls,
                  'qwen_concurrency': qwen_concurrency,
-                 'kimi_concurrency': kimi_concurrency}
+                 'kimi_concurrency': kimi_concurrency,
+                 'qwen_model_profile': qwen_model_profile,
+                 'kimi_model_profile': kimi_model_profile}
     try:
         info = runtime.stat()
     except OSError:
@@ -206,7 +338,14 @@ def save_settings(runtime: Path, *, qwen_coding_max_tool_calls=None,
     else:
         merged = {name: field['default'] for name, field in SETTINGS_FIELDS.items()}
     for name, value in overrides.items():
-        if value is not None:
+        if value is None:
+            continue
+        field = SETTINGS_FIELDS[name]
+        if field['kind'] == 'model':
+            # Selections are checked against the worker's verified allowlist
+            # (provider-owned configuration) before anything is written.
+            merged[name] = validate_model_profile_selection(field['worker'], value)
+        else:
             merged[name] = validate_setting(name, value)
     payload = json.dumps({'schema_version': SETTINGS_VERSION, **merged},
                          ensure_ascii=False, separators=(',', ':')).encode('utf-8')
