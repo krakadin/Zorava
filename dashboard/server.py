@@ -58,13 +58,20 @@ class DashboardController:
         # an explicit operator action; dashboard GETs stay offline.
         self.updates = UpdateRegistry()
 
-    @staticmethod
-    def _provider_base(adapter, name):
+    def _provider_base(self, adapter, name):
         try:
             version = adapter.version()
+            select = getattr(adapter, 'select_model_profile', None)
+            if callable(select):
+                # Apply the saved verified profile so the card reports the model
+                # future jobs will actually request. A stale or unverifiable
+                # selection fails closed here exactly as it does at job launch:
+                # the card reports UNAVAILABLE with a sanitized diagnostic and
+                # the adapter keeps its reviewed default model.
+                select(load_worker_model_profile(self.runtime, name))
             info = adapter.configuration_info()
             return {'worker': name, 'status': 'CONFIGURED', 'executable': str(adapter.executable),
-                    'version': version, 'requested_model': info.get('cli_model'),
+                    'version': version, 'requested_model': adapter.requested_model,
                     'provider': info.get('provider'), 'endpoint_host': info.get('endpoint_host'),
                     'endpoint_url': info.get('base_url'), 'authentication':
                     ('Qwen-owned credential present' if info.get('credential_present') else 'Qwen credential missing')
@@ -588,6 +595,11 @@ def make_handler(controller: DashboardController):
                         # Unsafe/malformed existing config or runtime directory;
                         # nothing was overwritten and no detail is exposed.
                         return self._error(500,'LOCAL_ACTION_FAILED','The requested local action failed safely.')
+                    snapshot = controller.provider_snapshot
+                    if isinstance(snapshot, dict) and isinstance(snapshot.get(worker), dict):
+                        # Keep the cached provider card consistent with the new
+                        # saved selection without re-running local CLI checks.
+                        snapshot[worker]['requested_model'] = selected
                     self._json({'status':'saved','worker':worker,'models':controller.model_catalog(),
                                 'note':f"{worker.capitalize()} model profile is now {selected}. Only verified "
                                         f"local profiles are selectable; endpoints and credentials are unchanged. "

@@ -20,7 +20,8 @@ from ai_router.request import MAX_REQUEST_BYTES, MAX_TASK_BYTES, DEFAULT_TIMEOUT
 from ai_router.landlock import LandlockUnavailable, landlock_abi
 from ai_router.settings import (MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT, UNLIMITED_TOOL_CALLS,
                                 SettingsError, load_settings, load_worker_concurrency,
-                                parse_budget_token, parse_concurrency_token, save_settings,
+                                load_worker_model_profile, parse_budget_token,
+                                parse_concurrency_token, save_settings,
                                 validate_model_profile_selection)
 from ai_router.state import StateStore
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
@@ -157,10 +158,15 @@ def command_preflight(args) -> int:
     try:
         adapter = {'kimi': KimiAdapter, 'qwen': QwenAdapter}[args.worker](RUNTIME / 'tmp')
         version = adapter.version()
+        select = getattr(adapter, 'select_model_profile', None)
+        if callable(select):
+            # Reflect the saved verified model profile. A stale or unverifiable
+            # selection fails closed with CONFIG_ERROR, exactly as job launch does.
+            select(load_worker_model_profile(RUNTIME, args.worker))
         info = adapter.configuration_info()
         value = {'schema_version': 1, 'worker': args.worker, 'status': 'CONFIGURED',
                  'executable': str(adapter.executable), 'version': version,
-                 'requested_model': info['cli_model'], 'provider': info['provider'],
+                 'requested_model': adapter.requested_model, 'provider': info['provider'],
                  'endpoint_host': info['endpoint_host'],
                  'authentication': ('Kimi Code managed OAuth; credential not inspected' if args.worker == 'kimi'
                                     else ('Qwen-owned credential present' if info['credential_present'] else 'Qwen credential missing')),
@@ -213,6 +219,14 @@ def command_status(args) -> int:
             capacities[name] = load_worker_concurrency(RUNTIME, name)
     except SettingsError:
         pass
+    # Saved verified model profiles, so status reports the model future jobs
+    # will actually request. An unreadable settings file keeps the defaults.
+    saved_models = {name: None for name in worker_names}
+    try:
+        for name in worker_names:
+            saved_models[name] = load_worker_model_profile(RUNTIME, name)
+    except SettingsError:
+        pass
     provider_status = {}
     for name, last_test in last_tests.items():
         status = 'UNKNOWN'
@@ -234,10 +248,18 @@ def command_status(args) -> int:
             'last_success_at': last_successes[name],
         }
     try:
-        qwen_info = QwenAdapter(RUNTIME/'tmp').configuration_info()
+        qwen_adapter = QwenAdapter(RUNTIME/'tmp')
+        select = getattr(qwen_adapter, 'select_model_profile', None)
+        if saved_models['qwen'] is not None and callable(select):
+            select(saved_models['qwen'])
+        qwen_info = qwen_adapter.configuration_info()
+        qwen_model = qwen_adapter.requested_model
     except (OSError, RuntimeError, ValueError):
+        # Configuration or the saved selection could not be verified; status
+        # still reports the saved ID while jobs themselves fail closed.
         qwen_info = {'provider': 'Alibaba Model Studio Token Plan', 'endpoint_host': 'unknown',
                      'cli_model': QwenAdapter.requested_model, 'credential_present': False}
+        qwen_model = saved_models['qwen'] or QwenAdapter.requested_model
     value = {
         'schema_version': 1,
         'claude': {
@@ -250,7 +272,7 @@ def command_status(args) -> int:
         'qwen': {
             'status': provider_status['qwen'],
             'executable': str(QwenAdapter(RUNTIME/'tmp').executable),
-            'requested_model': qwen_info['cli_model'],
+            'requested_model': qwen_model,
             'provider': qwen_info['provider'],
             'endpoint_host': qwen_info['endpoint_host'],
             'authentication': 'Qwen-owned credential present' if qwen_info['credential_present'] else 'Qwen credential missing',
@@ -262,7 +284,7 @@ def command_status(args) -> int:
         'kimi': {
             'status': provider_status['kimi'],
             'executable': '/home/krakadin/.kimi-code/bin/kimi',
-            'requested_model': 'kimi-code/k3',
+            'requested_model': saved_models['kimi'] or KimiAdapter.requested_model,
             'provider': 'Kimi Code',
             'authentication': 'Kimi Code-managed OAuth; credential not inspected',
             'concurrency': capacities['kimi'],

@@ -41,9 +41,9 @@ def verified_model_profiles(config_path: Path = KIMI_CONFIG) -> list[dict]:
         if path.is_symlink() or not path.is_file():
             raise ValueError
         info = path.stat()
-        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o022:
+        if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
             raise WorkerSetupError('CONFIG_ERROR',
-                                   'Kimi config must be user-owned and not group/world writable.')
+                                   'Kimi config must be user-owned and private.')
         raw = path.read_bytes()
     except WorkerSetupError:
         raise
