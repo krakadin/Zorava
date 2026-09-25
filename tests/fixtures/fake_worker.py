@@ -13,6 +13,10 @@ mode = sys.argv[1]
 payload = json.load(sys.stdin)
 if mode == 'success':
     print(json.dumps({'text':'fake worker completed','reported_model':'fake-v1','usage':{'input_tokens':3,'output_tokens':4}}))
+elif mode == 'usage-report':
+    # Valid provider-test reply: one bounded marked usage line.
+    print(json.dumps({'text':'QWEN_USAGE_REPORT input=3 output=4','reported_model':'fake-v1',
+                      'usage':{'input_tokens':3,'output_tokens':4}}))
 elif mode == 'malformed':
     print('not structured output')
 elif mode == 'crash':

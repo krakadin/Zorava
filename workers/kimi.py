@@ -13,7 +13,7 @@ import tempfile
 import tomllib
 
 from ai_router.request import WorkerRequest
-from .base import ParsedOutput, WorkerSetupError, common_child_environment
+from .base import ParsedOutput, WorkerSetupError, common_child_environment, usage_report_prompt
 from .workspace import IsolatedWorkspace
 
 
@@ -280,7 +280,7 @@ class KimiAdapter(IsolatedWorkspace):
         if profile.is_symlink() or not profile.is_file():
             raise WorkerSetupError('CONFIG_ERROR', 'Kimi smoke-test profile is missing or unsafe.')
         return [str(self.executable), '--model', self.requested_model,
-                '--agent-file', str(profile), '--prompt', 'Reply with exactly KIMI_WORKER_OK.',
+                '--agent-file', str(profile), '--prompt', usage_report_prompt('kimi'),
                 '--output-format', 'stream-json']
 
     def parse_output(self, raw: bytes) -> ParsedOutput:

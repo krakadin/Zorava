@@ -26,6 +26,7 @@ from ai_router.settings import (MAX_CONCURRENCY, MAX_TOOL_CALLS_LIMIT, UNLIMITED
 from ai_router.state import StateStore
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
 from ai_router.supervisor import Supervisor
+from workers.base import usage_report_prompt, validate_usage_report
 from workers.kimi import KimiAdapter
 from workers.qwen import QwenAdapter
 
@@ -38,7 +39,7 @@ EXIT_CODES = {
     'PATH_NOT_ALLOWED': 2, 'PATH_ACCESS_ERROR': 2,
     'CONFIG_ERROR': 3, 'AUTH_ERROR': 4, 'WORKER_CRASH': 5,
     'WORKER_BUSY': 5, 'INVALID_OUTPUT': 5, 'OUTPUT_LIMIT': 5,
-    'MODEL_UNAVAILABLE': 5, 'RATE_LIMITED': 5, 'QUOTA_OR_BILLING': 5, 'SMOKE_TEST_MISMATCH': 5,
+    'MODEL_UNAVAILABLE': 5, 'RATE_LIMITED': 5, 'QUOTA_OR_BILLING': 5, 'USAGE_REPORT_MISMATCH': 5,
     'NETWORK_ERROR': 5, 'BUDGET_EXHAUSTED': 5, 'TIMEOUT': 6, 'CANCELLED': 7,
     'SANDBOX_UNAVAILABLE': 3, 'PROJECT_DIRTY': 2,
     'NOT_A_GIT_REPOSITORY': 2, 'GIT_ERROR': 3, 'GIT_WORKTREE_ERROR': 3,
@@ -113,20 +114,21 @@ def command_run(args) -> int:
 
 
 def command_test(args) -> int:
-    task = f'Reply with exactly {args.worker.upper()}_WORKER_OK. Do not inspect files or call tools.'
+    # Fixed usage-report check: the provider is asked for its own session
+    # usage/stats in one bounded marked line. Qwen's prompt rides on stdin via
+    # build_payload; Kimi's build_test_command passes the same prompt in argv.
+    task = usage_report_prompt(args.worker)
     request = {'worker': args.worker, 'task': task, 'cwd': str(PROJECT),
                'mode': 'read-only', 'timeout_seconds': 120}
     if args.worker == 'qwen':
         request['max_tool_calls'] = 0
     value, code = run_request(json.dumps(request).encode('utf-8'), job_type='provider_test', job_id=args.job_id)
-    expected = f'{args.worker.upper()}_WORKER_OK'
     if value.get('status') == 'completed':
         received = (value.get('result') or '').strip()
-        value['expected_marker'] = expected
-        value['marker_received'] = received == expected
-        if received != expected:
-            value['error'] = {'code': 'SMOKE_TEST_MISMATCH',
-                              'message': 'Worker response did not match the expected marker.'}
+        problem = validate_usage_report(args.worker, received)
+        value['usage_report_received'] = problem is None
+        if problem is not None:
+            value['error'] = {'code': 'USAGE_REPORT_MISMATCH', 'message': problem}
             code = 5
     return emit_json(value, code) if args.json else print_human(value, code)
 
@@ -533,7 +535,7 @@ def make_parser() -> argparse.ArgumentParser:
                           help=f"Qwen tool-call budget: 'unlimited' or 0-{MAX_TOOL_CALLS_LIMIT} (not supported for kimi).")
     delegate.add_argument('--json', action='store_true')
     delegate.set_defaults(func=command_delegate)
-    test = commands.add_parser('test', help='Run a small live provider smoke test.')
+    test = commands.add_parser('test', help='Run a small live provider usage-report test.')
     test.add_argument('worker', choices=('qwen','kimi'))
     test.add_argument('--json', action='store_true')
     test.add_argument('--job-id', help=argparse.SUPPRESS)

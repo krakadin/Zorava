@@ -19,7 +19,7 @@ from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT, RequestError, parse_
 from ai_router.security import redact, summarize
 from ai_router.state import StateStore, ensure_private_directory
 from ai_router.supervisor import Supervisor
-from workers.base import ParsedOutput, common_child_environment
+from workers.base import ParsedOutput, common_child_environment, validate_usage_report
 
 
 FAKE = Path(__file__).parent/'fixtures/fake_worker.py'
@@ -182,14 +182,36 @@ class RequestAndRedactionTests(SupervisorFixture):
 
 
 class StateAndProcessTests(SupervisorFixture):
-    def test_smoke_test_mismatch_is_persisted_as_failure(self):
+    def test_invalid_usage_report_is_persisted_as_failure(self):
+        # A completed response without the worker's bounded usage report fails.
         result=self.supervisor.run(self.request(),job_type='provider_test')
         self.assertEqual(result.status,'invalid_output')
-        self.assertEqual(result.error['code'],'SMOKE_TEST_MISMATCH')
+        self.assertEqual(result.error['code'],'USAGE_REPORT_MISMATCH')
         job=self.supervisor.state.get_job(result.job_id)
-        self.assertEqual(job['error_code'],'SMOKE_TEST_MISMATCH')
+        self.assertEqual(job['error_code'],'USAGE_REPORT_MISMATCH')
         self.assertIsNotNone(job['completed_at'])
         self.assertIsNone(self.supervisor.state.last_successful_test('qwen'))
+
+    def test_valid_usage_report_completes_provider_test(self):
+        result=self.supervisor.run(self.request(),FakeAdapter('usage-report'),job_type='provider_test')
+        self.assertEqual(result.status,'completed')
+        self.assertEqual(result.result,'QWEN_USAGE_REPORT input=3 output=4')
+        job=self.supervisor.state.get_job(result.job_id)
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(job['usage_json'],'{"input_tokens":3,"output_tokens":4}')
+        self.assertIsNotNone(self.supervisor.state.last_successful_test('qwen'))
+
+    def test_usage_report_validation_is_bounded_and_per_worker(self):
+        self.assertIsNone(validate_usage_report('qwen','QWEN_USAGE_REPORT input=3 output=4'))
+        self.assertIsNone(validate_usage_report('kimi','  KIMI_USAGE_REPORT unavailable  '))
+        for worker,bad in (('qwen','KIMI_USAGE_REPORT input=3 output=4'),
+                           ('qwen','fake worker completed'),
+                           ('qwen','QWEN_USAGE_REPORT input=3\noutput=4'),
+                           ('qwen','QWEN_USAGE_REPORT <script>alert(1)</script>'),
+                           ('qwen','QWEN_USAGE_REPORT '+'x'*300),
+                           ('kimi','')):
+            with self.subTest(worker=worker,bad=bad[:40]):
+                self.assertIsNotNone(validate_usage_report(worker,bad))
 
     def test_qwen_exit_55_classifies_as_budget_exhausted(self):
         outcome = Supervisor._classify({'cancelled':False,'timed_out':False,'oversized':False},

@@ -20,7 +20,7 @@ from .security import MAX_TEXT, redact
 from .settings import (SettingsError, load_qwen_coding_budget,
                        load_worker_concurrency, load_worker_model_profile)
 from .state import StateStore
-from workers.base import WorkerSetupError
+from workers.base import WorkerSetupError, validate_usage_report
 
 
 MAX_STDOUT = 2 * 1024 * 1024
@@ -273,9 +273,13 @@ class Supervisor:
             status,code,message = self._classify(result,proc.returncode,stderr_text+'\n'+stdout_text,parsed,parse_error)
             parsed_text = parsed.text if parsed else ''
             safe_text, redactions = redact(parsed_text)
-            if job_type == 'provider_test' and status == 'completed' and safe_text.strip() != f'{request.worker.upper()}_WORKER_OK':
-                status, code, message = ('invalid_output', 'SMOKE_TEST_MISMATCH',
-                                         'Worker response did not match the expected test marker.')
+            if job_type == 'provider_test' and status == 'completed':
+                # A provider test must return the worker's own bounded,
+                # single-line usage report; anything else fails closed before
+                # the final state is persisted.
+                problem = validate_usage_report(request.worker, safe_text)
+                if problem is not None:
+                    status, code, message = ('invalid_output', 'USAGE_REPORT_MISMATCH', problem)
             if redactions:
                 self.state.event(job_id,'security redaction',f'{redactions} sensitive-looking value(s) removed')
             partial = safe_text if status != 'completed' and safe_text else None

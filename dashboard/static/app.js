@@ -226,7 +226,7 @@
     if (info.usage) card.append(usageSection(info));
     if (info.worker === 'qwen' || info.worker === 'kimi') {
       const actions=node('div',undefined,'provider-actions');
-      actions.append(node('small',`Makes a small live ${info.worker === 'qwen' ? 'Token Plan' : 'provider'} request.`));
+      actions.append(node('small',`Makes a small live ${info.worker === 'qwen' ? 'Token Plan' : 'provider'} request asking for a bounded usage/stats report. No account quota is inferred.`));
       const button=node('button',testing ? 'Testing…' : `Test ${info.worker[0].toUpperCase()+info.worker.slice(1)}`,'primary');
       button.disabled=testing;
       button.dataset.action='test'; button.dataset.worker=info.worker; actions.append(button); card.append(actions);
