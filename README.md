@@ -2,6 +2,8 @@
 
 **Local-first AI agent orchestration and operations for delegated coding work.**
 
+**Repository:** [github.com/krakadin/Zorava](https://github.com/krakadin/Zorava) — issues and discussion live there.
+
 Zorava is a self-hosted supervisor that lets a *host* AI agent — Claude Code today, with ChatGPT/Codex and other controllers on the roadmap — hire *specialist coding workers* such as **Qwen** and **Kimi**. Every delegated coding job runs as a bounded subprocess in its own detached Git worktree, with no shell, a path-scoped MCP file broker, and Linux Landlock write confinement; read-only analysis jobs run instead with a small fixed read-tool allowlist. Either way the worker returns a sanitized result — a report or a reviewable diff — and nothing is committed, merged, pushed, or applied to your checkout automatically.
 
 Zorava owns the operational layer around that delegation: worker capabilities and roles, verified model profiles, bounded concurrency slots, job lifecycle state and event logs, token usage and quota reporting, installed CLI versions and upgrade checks, 30-day retention cleanup, and reviewable diffs. It all runs on your machine, in your Unix account, with no daemon, no scheduler, no model proxy, and no provider credentials.
@@ -326,7 +328,7 @@ ai-worker settings set kimi-model kimi-code/k3      # verified managed Kimi alia
 - **Qwen Token Plan scope.** Zorava limits the Qwen path to synchronous, user-initiated tasks from an active host session; there is no scheduled, unattended, bulk, or standalone service path. That is a reasoned reading of Alibaba's interactive coding-agent terms, and Alibaba has not expressly endorsed this exact nested arrangement. Read [SECURITY_CHECKPOINT.md](SECURITY_CHECKPOINT.md) before enabling Qwen delegation.
 - **Credential rotation helper.** `tools/update_qwen_credential.py` is an optional, operator-run administrative tool that writes a replacement key into Qwen's own settings using hidden terminal input, an explicit typed confirmation, and an atomic 0600 write. It is not a credential store, never prints the value, and does not call any provider.
 
-Full details: [docs/security.md](docs/security.md).
+Full details: [Security checkpoint](SECURITY_CHECKPOINT.md) and the operational security notes in [docs/operations.md](docs/operations.md).
 
 ## Development and testing
 
@@ -349,7 +351,7 @@ Conventions worth knowing before changing code: no third-party dependencies, no 
 - **Same Unix user.** Workers run as you. Reads are not restricted at the OS level, so this is not isolation from a hostile local process.
 - **Synchronous only.** No queue service, retry policy, or webhook; a host agent must wait for the result.
 - **Two workers.** Qwen and Kimi only. Other provider CLIs need a new adapter plus verified model/endpoint review.
-- **No public remote is recorded.** The repository was developed on a local workstation and its own records list no Git remote, so there is no public issue tracker, release feed, or package registry to link yet.
+- **No release packaging yet.** The canonical public repository is [github.com/krakadin/Zorava](https://github.com/krakadin/Zorava) with a public issue tracker, but there is no release feed, package registry entry, or installer beyond cloning the repository.
 
 ## Roadmap
 
@@ -365,8 +367,8 @@ Planned direction — **none of the items below are implemented in this reposito
 
 ## Documentation
 
+- [Repository on GitHub](https://github.com/krakadin/Zorava) — canonical source, issue tracker, and project links.
 - [Architecture](docs/architecture.md) — worker routes, invocation details, sandboxing, dashboard internals.
 - [Operations](docs/operations.md) — daily use, full command list, health interpretation, error codes, version handling, rollback.
-- [Security model](docs/security.md) — credential boundaries, read-only and coding limits, local data handling, threat model.
-- [Security checkpoint](SECURITY_CHECKPOINT.md) — the credential-remediation record and the Qwen Token Plan usage-scope decision.
+- [Security checkpoint](SECURITY_CHECKPOINT.md) — the credential-remediation record, credential boundaries, and the Qwen Token Plan usage-scope decision.
 - [Audit](AUDIT.md) and [implementation spec](IMPLEMENTATION_SPEC.md) — historical source records for the system's design and requirements.
