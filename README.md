@@ -4,7 +4,7 @@
 
 **Repository:** [github.com/krakadin/Zorava](https://github.com/krakadin/Zorava) — issues and discussion live there.
 
-Zorava is a self-hosted supervisor that lets a *host* AI agent — Claude Code today, with ChatGPT/Codex and other controllers on the roadmap — hire *specialist coding workers* such as **Qwen** and **Kimi**. Every delegated coding job runs as a bounded subprocess in its own detached Git worktree, with no shell, a path-scoped MCP file broker, and Linux Landlock write confinement; read-only analysis jobs run instead with a small fixed read-tool allowlist. Either way the worker returns a sanitized result — a report or a reviewable diff — and nothing is committed, merged, pushed, or applied to your checkout automatically.
+Zorava is a self-hosted supervisor that lets a *host* AI agent — Claude Code and the Codex CLI today, with ChatGPT-hosted and other controllers on the roadmap — hire *specialist coding workers* such as **Qwen** and **Kimi**. Every delegated coding job runs as a bounded subprocess in its own detached Git worktree, with no shell, a path-scoped MCP file broker, and Linux Landlock write confinement; read-only analysis jobs run instead with a small fixed read-tool allowlist. Either way the worker returns a sanitized result — a report or a reviewable diff — and nothing is committed, merged, pushed, or applied to your checkout automatically.
 
 Zorava owns the operational layer around that delegation: worker capabilities and roles, verified model profiles, bounded concurrency slots, job lifecycle state and event logs, token usage and quota reporting, installed CLI versions and upgrade checks, 30-day retention cleanup, and reviewable diffs. It all runs on your machine, in your Unix account, with no daemon, no scheduler, no model proxy, and no provider credentials.
 
@@ -79,7 +79,7 @@ Accuracy matters more than marketing here, so the boundaries are explicit:
 ```text
 Host agents (your machine)
 ├── Claude Code ──direct──> Anthropic    its own OAuth session; never routed via Zorava
-└── ChatGPT / Codex                      host/controller integration: roadmap
+└── Codex CLI ──direct──> OpenAI         its own ChatGPT/OpenAI login; host skill in this checkout
       │
       │  ai-worker: synchronous CLI, task on stdin, JSON result on stdout
       v
@@ -124,7 +124,7 @@ Runtime state lives in `~/.local/state/ai-workers` (0700 directories, 0600 files
 | Agent | Relationship | Status in this repository |
 | --- | --- | --- |
 | **Claude / Claude Code** | Primary host and controller | **Supported.** Claude invokes `ai-worker` synchronously and keeps its direct Anthropic routing (its own Max OAuth). The integration instructions are a Claude Code skill installed outside this repository at `~/.claude/skills/delegate-workers/SKILL.md`; `ai-worker status` reports local Claude routing and cached worker test state. |
-| **ChatGPT / Codex** | Host and controller | **Direction, not a packaged integration.** No ChatGPT/Codex skill, adapter, or worker exists in this repository. The CLI contract is agent-agnostic (task on stdin, JSON on stdout), so any local controller that can run `ai-worker` can drive it today; a supported, documented integration is roadmap work. |
+| **Codex CLI** | Host and controller | **Supported when Codex runs in a checkout of this repository.** Codex keeps its own ChatGPT/OpenAI login and model routing and drives `ai-worker` synchronously through its shell tool. The instructions ship in-repo as a Codex-discoverable skill at [`.agents/skills/delegate-workers/SKILL.md`](.agents/skills/delegate-workers/SKILL.md); see [Codex CLI host integration](#codex-cli-host-integration-repository-skill). No Codex adapter, provider call, endpoint, or credential path is added, and nothing is written to `~/.codex`. A **ChatGPT-hosted** controller remains roadmap work; the CLI contract is agent-agnostic (task on stdin, JSON on stdout), so any local controller that can run `ai-worker` can drive it today. |
 | Other host agents | Host and controller | Roadmap (same CLI contract). |
 
 **Managed coding workers** are specialist provider CLIs that Zorava launches under supervision.
@@ -137,6 +137,29 @@ Runtime state lives in `~/.local/state/ai-workers` (0700 directories, 0600 files
 For both workers, output is parsed into normalized JSON and the child environment is built explicitly so no other provider's credentials are inherited. `KIMI_CODE_NO_AUTO_UPDATE=1` is set for supervised Kimi runs so a job never changes the pinned CLI.
 
 Additional provider CLIs can be added behind the adapter contract in `workers/base.py`; none ship today.
+
+### Codex CLI host integration (repository skill)
+
+Codex CLI is a supported host agent when you run it inside a checkout of this repository. The integration is guidance, not code: this repository ships a Codex skill at [`.agents/skills/delegate-workers/SKILL.md`](.agents/skills/delegate-workers/SKILL.md) telling Codex to stay the orchestrator and to run the same `ai-worker` commands Claude runs. Zorava adds no Codex adapter, no OpenAI-compatible endpoint, and no credential path; Codex keeps its own ChatGPT/OpenAI login and model routing exactly as Claude keeps its Anthropic routing.
+
+**Discovery and installation.** Codex loads repository skills from `.agents/skills/<skill-name>/SKILL.md` beneath the directory where it runs, so the skill itself needs no installation step — only `ai-worker` on your `PATH`:
+
+```bash
+cd /path/to/this/repository                        # the checkout that contains .agents/skills/
+ln -s "$PWD/bin/ai-worker" ~/.local/bin/ai-worker  # once; skip if already installed
+codex                                              # start Codex CLI inside this checkout
+```
+
+The skill is repository-scoped: nothing is written to `~/.codex`, and your other projects are unaffected. If your Codex build does not surface repository skills, tell Codex to read `.agents/skills/delegate-workers/SKILL.md` before delegating — the CLI contract does not depend on skill discovery. To stop using it, delete `.agents/skills/delegate-workers/` from the checkout, or simply stop asking Codex to delegate.
+
+**Safe example.** A bounded, read-only investigation that cannot modify anything:
+
+```bash
+printf '%s' 'Find where the worker timeout is validated. Cite paths and line numbers; do not modify files.' |
+  ai-worker delegate qwen --cwd "$PWD" --mode read-only --timeout 900 --json
+```
+
+Coding is the same command with `--mode isolated-edit` (the default): the worker edits a detached worktree under `~/.local/state/ai-workers/jobs/JOB_UUID/worktree` and returns `workspace` plus `diff` as a proposal. Codex reads that proposal, checks the worker's claims against the real files, and applies changes to your checkout only after you have seen them. Every other Zorava rule is unchanged — clean checkout and Linux Landlock for coding, task text on stdin, 10–1800 second timeouts, per-worker slot limits (Qwen 2, Kimi 1) with queueing, no credentials in Zorava, no endpoint or model override from a job, no recursive delegation, and no automatic commit, merge, push, or deploy. The worker role prompts in `profiles/` were written for a Claude parent; that wording says who reviews the result and does not change behavior for a Codex host. Command details: [Operations](docs/operations.md).
 
 ## Isolation model
 
@@ -350,6 +373,7 @@ Conventions worth knowing before changing code: no third-party dependencies, no 
 - **Linux only.** Landlock is required for coding mode; there is no macOS or Windows sandbox equivalent implemented, and no less-restricted fallback.
 - **Same Unix user.** Workers run as you. Reads are not restricted at the OS level, so this is not isolation from a hostile local process.
 - **Synchronous only.** No queue service, retry policy, or webhook; a host agent must wait for the result.
+- **Codex support is documentation, not code.** The repository skill teaches Codex CLI to drive the existing `ai-worker` contract; there is no Codex adapter or credential path, discovery depends on your Codex build supporting `.agents/skills`, and no live Codex-hosted delegation is recorded as verified in this repository.
 - **Two workers.** Qwen and Kimi only. Other provider CLIs need a new adapter plus verified model/endpoint review.
 - **No release packaging yet.** The canonical public repository is [github.com/krakadin/Zorava](https://github.com/krakadin/Zorava) with a public issue tracker, but there is no release feed, package registry entry, or installer beyond cloning the repository.
 
@@ -357,7 +381,7 @@ Conventions worth knowing before changing code: no third-party dependencies, no 
 
 Planned direction — **none of the items below are implemented in this repository**:
 
-- **Packaged host integrations beyond Claude Code**, including a documented ChatGPT/Codex controller path and a reusable integration contract for other host agents.
+- **Packaged host integrations beyond Claude Code and the Codex CLI**, including a ChatGPT-hosted controller path and a reusable integration contract for other host agents.
 - **Additional specialist workers** behind the existing adapter contract, each with its own verified model/endpoint allowlist and role profiles.
 - **Richer worker relationship modeling**: delegation trees and groups surfaced in the CLI and dashboard, cost rollups per delegation group, and per-role capability metadata.
 - **Stronger isolation**: OS-level read confinement (or a container/namespace option) and per-project policy profiles.
@@ -370,6 +394,7 @@ Planned direction — **none of the items below are implemented in this reposito
 - [Repository on GitHub](https://github.com/krakadin/Zorava) — canonical source, issue tracker, and project links.
 - [Architecture](docs/architecture.md) — worker routes, invocation details, sandboxing, dashboard internals.
 - [Operations](docs/operations.md) — daily use, full command list, health interpretation, error codes, version handling, rollback.
+- [Codex host skill](.agents/skills/delegate-workers/SKILL.md) — the repository-scoped delegation instructions Codex CLI discovers in a checkout.
 - [Security model](docs/security.md) — credential boundaries, read-only and isolated-edit controls, redaction, threat model, and limitations.
 - [Security checkpoint](SECURITY_CHECKPOINT.md) — the credential-remediation record, credential boundaries, and the Qwen Token Plan usage-scope decision.
 - [Audit](AUDIT.md) and [implementation spec](IMPLEMENTATION_SPEC.md) — historical source records for the system's design and requirements.

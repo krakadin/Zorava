@@ -4,6 +4,8 @@
 
 Start Claude normally with `claude`. For user-directed work in that active session, ask Claude to delegate coding to Qwen or Kimi. Both default to independent Git worktrees and return diffs for review; request read-only mode for analysis. Claude invokes `ai-worker` synchronously, receives JSON, and remains responsible for checking the findings. Qwen is not run on a schedule or as unattended/bulk work. The optional dashboard is not required.
 
+Codex CLI works the same way when it runs inside a checkout of this repository: it discovers the repository skill at `.agents/skills/delegate-workers/SKILL.md`, stays the orchestrator, and runs the same `ai-worker delegate` commands with the task on stdin and `--json`. Nothing is installed under `~/.codex`, and the host agent does not change worker selection, sandboxing, model profiles, or credential behavior.
+
 ## Commands
 
 ```bash
@@ -77,4 +79,4 @@ Tested locally: Python standard library; Qwen Code 0.24.4 at `/home/krakadin/.lo
 
 ## Rollback
 
-To disable the Claude integration, remove `~/.claude/skills/delegate-workers/SKILL.md` and its now-empty directory, then remove the `~/.local/bin/ai-worker` symlink. The source repository and `~/.local/state/ai-workers` job history can be archived or removed separately after review. Do not remove or alter Claude, Qwen, or Kimi installations or their provider-owned history/credentials. A rotated/revoked credential must never be restored.
+To disable the Claude integration, remove `~/.claude/skills/delegate-workers/SKILL.md` and its now-empty directory, then remove the `~/.local/bin/ai-worker` symlink. The Codex integration is repository-scoped: delete `.agents/skills/delegate-workers/` from the checkout, as nothing was installed under `~/.codex`. The source repository and `~/.local/state/ai-workers` job history can be archived or removed separately after review. Do not remove or alter Claude, Qwen, or Kimi installations or their provider-owned history/credentials. A rotated/revoked credential must never be restored.

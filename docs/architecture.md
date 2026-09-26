@@ -11,7 +11,7 @@ Claude Code --direct--> Anthropic / Claude (existing Max OAuth)
                          existing Kimi OAuth
 ```
 
-Claude remains the orchestrator. ai-worker invokes Kimi only when Claude or the user explicitly chooses delegation. The worker is a separate process with bounded task/context; it is not a native Claude subagent. The normalized JSON result returns to Claude, which checks important claims and makes the final decision.
+Claude remains the orchestrator. ai-worker invokes Kimi only when Claude or the user explicitly chooses delegation. The worker is a separate process with bounded task/context; it is not a native Claude subagent. The normalized JSON result returns to Claude, which checks important claims and makes the final decision. The same contract applies to any host agent that can run `ai-worker`: the Codex CLI host path is documented in the [README](../README.md) and its repository skill at `../.agents/skills/delegate-workers/SKILL.md`, and it changes no adapter, sandbox, or credential behavior.
 
 The project has no provider proxy. Claude's Anthropic traffic does not pass through ai-worker. Qwen delegation is limited to synchronous, user-directed work from the active Claude session. The Token Plan interpretation and its limits are recorded in `SECURITY_CHECKPOINT.md`; Alibaba has not expressly endorsed this exact nested arrangement.
 
