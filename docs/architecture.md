@@ -4,6 +4,7 @@
 
 ```text
 Claude Code --direct--> Anthropic / Claude (existing Max OAuth)
+Codex CLI  --direct--> OpenAI / ChatGPT (its own login; in-repo skill)
      |
      +-- ai-worker --> pinned Qwen Code CLI --> Token Plan / qwen3.8-max
      |                   Qwen-owned local config
@@ -11,9 +12,9 @@ Claude Code --direct--> Anthropic / Claude (existing Max OAuth)
                          existing Kimi OAuth
 ```
 
-Claude remains the orchestrator. ai-worker invokes Kimi only when Claude or the user explicitly chooses delegation. The worker is a separate process with bounded task/context; it is not a native Claude subagent. The normalized JSON result returns to Claude, which checks important claims and makes the final decision. The same contract applies to any host agent that can run `ai-worker`: the Codex CLI host path is documented in the [README](../README.md) and its repository skill at `../.agents/skills/delegate-workers/SKILL.md`, and it changes no adapter, sandbox, or credential behavior.
+The active host agent — Claude Code or the Codex CLI — remains the orchestrator. ai-worker invokes Kimi only when the host agent or the user explicitly chooses delegation. The worker is a separate process with bounded task/context; it is not a native subagent of either host. The normalized JSON result returns to the host agent, which checks important claims and makes the final decision. The same contract applies to any host agent that can run `ai-worker`: the Codex CLI host path is documented in the [README](../README.md) and its repository skill at `../.agents/skills/delegate-workers/SKILL.md`, and it changes no adapter, sandbox, or credential behavior.
 
-The project has no provider proxy. Claude's Anthropic traffic does not pass through ai-worker. Qwen delegation is limited to synchronous, user-directed work from the active Claude session. The Token Plan interpretation and its limits are recorded in `SECURITY_CHECKPOINT.md`; Alibaba has not expressly endorsed this exact nested arrangement.
+The project has no provider proxy. Neither host's provider traffic — Claude's Anthropic OAuth or Codex's OpenAI login — passes through ai-worker. Qwen delegation is limited to synchronous, user-directed work from the active host session. The Token Plan interpretation and its limits are recorded in `SECURITY_CHECKPOINT.md`; Alibaba has not expressly endorsed this exact nested arrangement.
 
 Qwen's adapter verifies that the current active model matches the saved selected profile (default `qwen3.8-max`) and that both configured base URLs use `https://token-plan.maas.qwencloudapi.com/compatible-mode/v1`. It reports only endpoint hostname and credential presence; the key remains in Qwen's settings and is neither inherited nor copied by ai-router. Its requested model is explicit. No fallback model, alternate endpoint, scheduler, background worker service, or unattended/bulk path exists.
 
@@ -43,11 +44,11 @@ The editing profile exposes only six local MCP tools: `get_task`, `list_files`, 
 
 The Kimi process is additionally launched under Linux Landlock (tested locally at ABI 8). Writes are allowed only inside that job's private runtime directory and Kimi's own OAuth directory, which the CLI may need to refresh. The model has no file tool targeting the OAuth directory. Reads remain unrestricted at the OS level: this is write confinement, not a complete filesystem sandbox. If Landlock is unavailable, edit mode fails closed. The worktree protects the primary checkout from edits, but is not itself a security boundary.
 
-On completion, ai-worker returns the worktree location and a bounded sanitized diff. Nothing is copied into the primary checkout. Claude reviews the diff; the user controls any later import. `ai-worker diff JOB_UUID` re-reads it, and `ai-worker discard JOB_UUID --confirm` explicitly removes only that job's worktree and per-job Kimi history. There is no automatic commit, merge, push, test execution, or deployment.
+On completion, ai-worker returns the worktree location and a bounded sanitized diff. Nothing is copied into the primary checkout. The host agent reviews the diff; the user controls any later import. `ai-worker diff JOB_UUID` re-reads it, and `ai-worker discard JOB_UUID --confirm` explicitly removes only that job's worktree and per-job Kimi history. There is no automatic commit, merge, push, test execution, or deployment.
 
 ## Optional local dashboard
 
-`ai-worker dashboard` starts a standard-library HTTP server on `127.0.0.1:8787`. It reads the same SQLite job state and invokes only predefined provider-test, cancellation, and retention actions. It does not accept arbitrary prompts, expose a shell, or serve arbitrary filesystem paths. It is not required for synchronous Claude delegation; no daemon or systemd service is required.
+`ai-worker dashboard` starts a standard-library HTTP server on `127.0.0.1:8787`. It reads the same SQLite job state and invokes only predefined provider-test, cancellation, and retention actions. It does not accept arbitrary prompts, expose a shell, or serve arbitrary filesystem paths. It is not required for synchronous host delegation; no daemon or systemd service is required.
 
 The UI shows safe provider configuration metadata, cached health, jobs, sanitized event logs, permission summaries, and retention settings. Endpoint and credential changes are never exposed as form inputs. Model profiles can be selected on the Settings page, but only from the locally verified allowlists (Qwen Token Plan profiles on the reviewed endpoint; managed Kimi Code aliases); any other model requires a separately verified configuration change, and credentials remain provider-owned.
 
