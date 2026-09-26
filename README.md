@@ -60,7 +60,7 @@ Zorava takes the third path seriously: keep the host agent in charge, keep each 
 | **Usage and quota reporting** | Per-job token totals (input/output/cached) and, for Kimi, account quota windows refreshed only by an explicit, cooldown-limited loopback action. |
 | **CLI version and upgrade checks** | Provider cards show the installed CLI version; `Check for upgrades` is one bounded read-only HTTPS GET to a pinned official source. Upgrades are labeled, never performed. |
 | **Retention cleanup** | 30-day retention for terminal local records, dry-run by default, purged only with `--confirm`. Active jobs and retained worktrees are protected; provider histories are never touched. |
-| **Loopback dashboard and JSON API** | A standard-library HTTP server on `127.0.0.1:8787` with Overview, Jobs, Providers, Permissions, Logs, and Settings views. |
+| **Loopback dashboard and JSON API** | A standard-library HTTP server on `127.0.0.1:8787` with Overview, Hosts, Jobs, Providers, Permissions, Logs, and Settings views. |
 | **Provider health tests** | `ai-worker test qwen|kimi` runs a small live usage-report request and records the marker-validated result as an ordinary job. |
 
 ## What Zorava is not
@@ -126,6 +126,8 @@ Runtime state lives in `~/.local/state/ai-workers` (0700 directories, 0600 files
 | **Claude / Claude Code** | Primary host and controller | **Supported.** Claude invokes `ai-worker` synchronously and keeps its direct Anthropic routing (its own Max OAuth). The integration instructions are a Claude Code skill installed outside this repository at `~/.claude/skills/delegate-workers/SKILL.md`; `ai-worker status` reports local Claude routing and cached worker test state. |
 | **Codex CLI** | Host and controller | **Supported when Codex runs in a checkout of this repository.** Codex keeps its own ChatGPT/OpenAI login and model routing and drives `ai-worker` synchronously through its shell tool. The instructions ship in-repo as a Codex-discoverable skill at [`.agents/skills/delegate-workers/SKILL.md`](.agents/skills/delegate-workers/SKILL.md); see [Codex CLI host integration](#codex-cli-host-integration-repository-skill). No Codex adapter, provider call, endpoint, or credential path is added, and nothing is written to `~/.codex`. A **ChatGPT-hosted** controller remains roadmap work; the CLI contract is agent-agnostic (task on stdin, JSON on stdout), so any local controller that can run `ai-worker` can drive it today. |
 | Other host agents | Host and controller | Roadmap (same CLI contract). |
+
+The dashboard's **Hosts** view (`GET /api/v1/hosts`) shows this layer directly, separate from the managed worker cards on the Providers page: Claude Code and the Codex CLI with their detected local executable, bounded `--version` output, and delegation-skill path, and the ChatGPT-hosted controller as an explicit `ROADMAP`/unavailable entry. Host metadata is local and cached — no host credential, OAuth, or token file is read, nothing is written to `~/.codex`, and no host agent or provider is ever called.
 
 **Managed coding workers** are specialist provider CLIs that Zorava launches under supervision.
 
@@ -300,7 +302,7 @@ Endpoints:
 
 | Method | Path | Behavior |
 | --- | --- | --- |
-| `GET` | `/api/v1/session`, `/api/v1/status`, `/api/v1/providers`, `/api/v1/updates`, `/api/v1/usage`, `/api/v1/permissions`, `/api/v1/settings`, `/api/v1/jobs`, `/api/v1/jobs/<id>`, `/api/v1/logs`, `/api/v1/cleanup/preview` | Local and cache reads only — page refreshes and polling never touch the network or a provider |
+| `GET` | `/api/v1/session`, `/api/v1/status`, `/api/v1/providers`, `/api/v1/hosts`, `/api/v1/updates`, `/api/v1/usage`, `/api/v1/permissions`, `/api/v1/settings`, `/api/v1/jobs`, `/api/v1/jobs/<id>`, `/api/v1/logs`, `/api/v1/cleanup/preview` | Local and cache reads only — page refreshes and polling never touch the network or a provider |
 | `POST` | `/api/v1/test/qwen`, `/api/v1/test/kimi` | Start a fixed, small live provider usage-report test tracked as a normal job (fresh CSRF token per action) |
 | `POST` | `/api/v1/jobs/<id>/cancel` | Cancel a running or queued job |
 | `POST` | `/api/v1/settings/concurrency`, `/api/v1/settings/model` | Persist validated values through the same private `settings.json` write as the CLI |
@@ -336,6 +338,7 @@ ai-worker settings set kimi-model kimi-code/k3      # verified managed Kimi alia
 ## Usage, quotas, and CLI versions
 
 - **Token usage.** Per-job input/output/cached token totals are parsed from each CLI's own output and summed over completed jobs in retained local history.
+- **Host agents.** `GET /api/v1/hosts` and the dashboard's Hosts view report the host/controller layer separately from the managed workers: Claude Code and the Codex CLI as local host integrations (a fixed executable name resolved inside a fixed `PATH` allowlist, one bounded `--version` probe of the resolved file, and an existence check of `~/.claude/skills/delegate-workers/SKILL.md` or the in-repo `.agents/skills/delegate-workers/SKILL.md`), plus the ChatGPT-hosted controller as an explicit `ROADMAP` entry with no local executable. The snapshot is cached after the first read, offers no refresh or test action, reads no host credential/OAuth/token file, never writes to `~/.codex`, and makes no provider or network call.
 - **Kimi account quota.** The Kimi card shows quota windows (percent used, percent remaining, reset time) with an honest available/stale/unavailable state, served from a memory-only cache. `Refresh usage` is an explicit CSRF-protected action that performs one loopback `GET http://127.0.0.1:<port>/api/v1/oauth/usage` against an **already-running** local Kimi server, using the Kimi-owned local server token, at most once per 60 seconds. Zorava never starts `kimi web`, never generates or stores that token, and never returns it or the raw provider body.
 - **Qwen account quota.** There is no reliable account-quota API, so the Qwen card states plainly that account-level remaining quota is unavailable and shows only local per-job token totals. No percentage or balance is ever inferred or fabricated.
 - **CLI versions and upgrades.** `installed_version` comes from the pinned CLI's own `--version`. `update_state` is cached metadata: `unknown`, `checking`, `up-to-date`, `update-available`, or `stale`. `Check for upgrades` performs a single bounded read-only HTTPS GET against two pinned official sources (`registry.npmjs.org` for Qwen, `code.kimi.com` for Kimi) with no environment proxies, no redirects, no cookies, no `Authorization` header, no caller-supplied URL, a 6-second timeout, and an 8192-byte response cap. Zorava compares versions and reports; it never installs, patches, or restarts a CLI. Apply upgrades yourself through the provider's official installer, then re-run `preflight` and an explicit test.

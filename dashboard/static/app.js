@@ -312,6 +312,53 @@
     await refreshProviderCards();
     flash('The quota refresh is still running; the card updates on the next automatic refresh.');
   }
+  // Host agents are the orchestrators that delegate to the managed workers. They
+  // are reported from local metadata only (fixed executable names, fixed skill
+  // paths), so this section has no action, no POST, and never reads a host
+  // credential or calls a host.
+  function hostCard(host) {
+    const roadmap = host.status === 'ROADMAP';
+    const card=node('article',undefined,`card host-card${roadmap ? ' host-roadmap' : ''}`);
+    const head=node('div',undefined,'card-head');
+    head.append(node('h2',host.name||'Host agent')); head.append(badge(host.status));
+    head.append(node('span',roadmap ? 'Planned hosted controller' : 'Local host integration','pill'));
+    card.append(head);
+    const dl=node('dl',undefined,'kv');
+    addKV(dl,'Role',host.role);
+    addKV(dl,'Integration',host.integration);
+    addKV(dl,'Executable',host.executable || (roadmap ? 'None · hosted integration is planned' : 'Not detected on this machine'),true);
+    addKV(dl,'Version',host.version || 'Unknown',true);
+    addKV(dl,'Delegation skill',host.skill_path ? `${host.skill_path} · ${host.skill_state}` : host.skill_state,true);
+    addKV(dl,'Host credentials',host.credentials);
+    card.append(dl);
+    card.append(node('p',host.detail,'prose'));
+    return card;
+  }
+
+  function hostSummary(data) {
+    const box=panel('HOST AGENTS');
+    const dl=node('dl',undefined,'kv');
+    (data.hosts||[]).forEach(host=>{
+      const state=host.status==='ROADMAP'
+        ? 'Roadmap · hosted integration planned; nothing installed here'
+        : `${host.integration}${host.version?` · ${host.version}`:''} · skill ${(host.skill_state||'').toLowerCase()}`;
+      addKV(dl,host.name,state);
+    });
+    box.append(dl);
+    box.append(node('p',data.note||'Local host metadata only; host credentials are never read.','notice'));
+    return box;
+  }
+
+  async function hostsPage() {
+    title('Host agents','Host/controller agents that delegate to the managed Qwen and Kimi workers. Local metadata only: no host credential is read, no host is called, and opening this page makes no provider or network request.');
+    const data=await get('/api/v1/hosts');
+    const cards=node('div',undefined,'cards');cards.id='host-cards';
+    (data.hosts||[]).forEach(host=>cards.append(hostCard(host)));
+    root.append(cards);
+    root.append(node('p',data.note||'','notice'));
+    root.append(node('p','Managed provider workers (Qwen and Kimi) stay on the Providers page. Host agents are the layer above them: they decide what to delegate and review the returned diff. Zorava never launches, tests, or calls a host agent, and the ChatGPT-hosted controller is roadmap only.','prose'));
+  }
+
   async function overview() {
     title('Overview','Local worker health, active jobs, and recent outcomes.');
     root.append(node('div','Claude stays direct to Anthropic. Delegated workers are separate CLI processes.','banner'));
@@ -319,6 +366,8 @@
     const cards=node('div',undefined,'cards');cards.id='provider-cards';
     ['claude','qwen','kimi'].forEach(name => cards.append(providerCard(data.providers[name])));
     root.append(cards);
+    // Host/controller layer, kept visually separate from the managed workers.
+    root.append(hostSummary(await get('/api/v1/hosts')));
     const counts=data.counts?.today || {};
     const metrics=node('div',undefined,'metrics');
     [['Jobs today',Object.values(counts).reduce((a,b)=>a+b,0)],['Completed',counts.completed||0],['Failed',counts.failed||0],['Cancelled',counts.cancelled||0]].forEach(([label,value])=>{
@@ -376,6 +425,7 @@
     const data=await get('/api/v1/providers');const cards=node('div',undefined,'cards');cards.id='provider-cards';
     ['claude','qwen','kimi'].forEach(name=>cards.append(providerCard(data.providers[name])));root.append(cards);
     const note=node('p','Credentials remain in their provider-owned CLI configuration. Test status refreshes automatically from local records; provider calls only run when you click Test. CLI version metadata is cached: a version source is read only when you click Check for upgrades, and this dashboard never installs an upgrade.','notice');root.append(note);
+    const hostLink=node('a','Claude Code and the Codex CLI are host agents, not managed workers — see the Hosts page for the local host/controller layer.','crumb');hostLink.href='/?page=hosts';root.append(hostLink);
     const config=panel('MODEL AND ROUTING');
     config.append(node('p','Selecting among locally verified model profiles is available on the Settings page. Provider URLs and credentials are never shown or editable here; Qwen stays on its reviewed Token Plan endpoint and its key, and Kimi stays on its managed Kimi Code provider. Qwen’s Token Plan key must not be sent to its separate pay-as-you-go endpoints.','prose'));
     root.append(config);
@@ -454,6 +504,7 @@
     try {
       if(page==='overview') await overview();
       else if(page==='jobs') await jobsPage();
+      else if(page==='hosts') await hostsPage();
       else if(page==='providers') await providersPage();
       else if(page==='permissions') await permissionsPage();
       else if(page==='logs') await logsPage();

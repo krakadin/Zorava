@@ -22,6 +22,7 @@ from urllib.parse import parse_qs, urlsplit
 PROJECT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT))
 
+from ai_router.hosts import detect_hosts, probe_host_version
 from ai_router.kimi_quota import QUOTA_REFRESH_COOLDOWN_S, QuotaCache
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.retention import DEFAULT_RETENTION_DAYS, apply_cleanup, preview_cleanup
@@ -46,7 +47,8 @@ MAX_HTTP_BODY = 4096
 
 
 class DashboardController:
-    def __init__(self, runtime: Path = RUNTIME, port: int = DEFAULT_PORT, quota_cache=None):
+    def __init__(self, runtime: Path = RUNTIME, port: int = DEFAULT_PORT, quota_cache=None,
+                 host_probe=None):
         self.runtime = runtime
         self.port = port
         self.store = StateStore(runtime / 'workers.db')
@@ -63,6 +65,15 @@ class DashboardController:
         # Cached, read-only CLI version metadata. It is only ever refreshed by
         # an explicit operator action; dashboard GETs stay offline.
         self.updates = UpdateRegistry()
+        # Host/controller agents (Claude Code, the Codex CLI, and the planned
+        # ChatGPT-hosted controller) are reported separately from managed
+        # workers. Detection stays local: two fixed executable names inside a
+        # fixed PATH allowlist, one bounded --version probe per resolved host,
+        # and two fixed skill-path existence checks. No host credential, OAuth,
+        # or token file is read and no provider or network call is made. The
+        # probe is injectable so tests never spawn a host CLI.
+        self.host_probe = probe_host_version if host_probe is None else host_probe
+        self.host_snapshot = None
 
     def _provider_base(self, adapter, name):
         try:
@@ -190,6 +201,24 @@ class DashboardController:
             values[name] = info
         values['claude'] = self.provider_snapshot['claude']
         return values
+
+    def hosts_snapshot(self) -> dict:
+        """Cached local view of the host/controller agents; never a provider call.
+
+        The first call resolves two fixed executable names inside a fixed PATH
+        allowlist, runs at most one bounded ``--version`` probe per resolved host
+        CLI, and checks two fixed delegation-skill paths. Later calls reuse the
+        cached snapshot, so dashboard GETs and polling stay local and cheap. No
+        host credential file is read and nothing here can be parameterized by a
+        request, a job, or repository content.
+        """
+        with self._lock:
+            if self.host_snapshot is None:
+                self.host_snapshot = detect_hosts(probe=self.host_probe)
+            snapshot = self.host_snapshot
+            return {'generated_at': snapshot['generated_at'],
+                    'hosts': [dict(host) for host in snapshot['hosts']],
+                    'note': snapshot['note']}
 
     def _installed_versions(self) -> dict:
         """Installed CLI versions from the already cached provider snapshot."""
@@ -541,6 +570,12 @@ def make_handler(controller: DashboardController):
                     return
                 if path == '/api/v1/providers':
                     self._json({'providers':controller.providers()}); return
+                if path == '/api/v1/hosts':
+                    # Local host/controller metadata only: fixed executable names
+                    # inside a fixed PATH allowlist, fixed skill paths, no host
+                    # credential file, and no provider or network call. Cached
+                    # after the first read, so polling stays local and cheap.
+                    self._json(controller.hosts_snapshot()); return
                 if path == '/api/v1/updates':
                     # Cache-only: a dashboard refresh must never reach a version source.
                     self._json(controller.updates_snapshot()); return
