@@ -18,9 +18,12 @@ What this module is allowed to look at, and nothing more:
   names qualify, an active NVM bin from the inherited PATH is preferred solely
   after it validates as such, and otherwise the highest numeric installed Node
   version with the executable is chosen. Installation, bin, and executable
-  paths are resolved and must stay inside the installation, so normal npm bin
-  symlinks into its own ``lib`` tree work while directory or executable
-  symlinks escaping it are rejected. Arbitrary inherited PATH entries and
+  paths are resolved and must stay inside the installation, and an offered
+  installation path must be an absolute direct lexical child of the root
+  before any symlink is followed, so project or relative aliases into the
+  trusted tree never qualify. Normal npm bin symlinks into an installation's
+  own ``lib`` tree work while directory or executable symlinks escaping it
+  are rejected. Arbitrary inherited PATH entries and
   project directories are never searched.
 * at most one bounded ``<resolved executable> --version`` probe per local host,
   with a sanitized environment, no stdin, a short timeout, and a short parsed
@@ -144,15 +147,21 @@ def _inside(child, parent):
 def _valid_nvm_install(install, root=None):
     """(version tuple, resolved install) for a genuine NVM installation dir.
 
-    Only ``vMAJOR.MINOR.PATCH`` directory names qualify, and the directory
-    itself must resolve directly beneath the fixed NVM root, so a symlinked
-    installation directory escaping the root is rejected. Anything else --
-    non-directories, missing entries, other names -- returns None.
+    Only ``vMAJOR.MINOR.PATCH`` directory names qualify, and the offered path
+    itself must be an absolute, direct lexical child of the fixed NVM root
+    *before* any symlink is followed, so a relative alias, a ``..`` traversal,
+    or a project-controlled symlink that merely resolves inside the root is
+    rejected outright. The directory must additionally resolve directly
+    beneath the root, so a symlinked installation directory escaping the root
+    is rejected. Anything else -- non-directories, missing entries, other
+    names -- returns None.
     """
     root = NVM_ROOT if root is None else Path(root)
     install = Path(install)
     match = _NVM_VERSION_DIR.fullmatch(install.name)
     if match is None:
+        return None
+    if not install.is_absolute() or install.parent != root:
         return None
     resolved_root = _resolved(root)
     resolved_install = _resolved(install)

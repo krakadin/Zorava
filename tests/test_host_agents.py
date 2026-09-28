@@ -307,6 +307,37 @@ class NvmHostDiscoveryTests(unittest.TestCase):
             self.assertIsNone(self.resolve_without_fixed_path('codex'))
             self.assertIsNone(self.resolve_without_fixed_path('claude'))
 
+    def test_project_symlink_alias_into_trusted_install_never_wins(self):
+        _install, links = self.make_install('v22.23.1')
+        project = Path(self.temp.name) / 'project'
+        project.mkdir()
+        # A project-controlled symlink whose target is the trusted install.
+        (project / 'v22.23.1').symlink_to(self.root / 'v22.23.1', target_is_directory=True)
+        alias_bin = project / 'v22.23.1' / 'bin'
+        with patch.dict(os.environ, {'PATH': f'{alias_bin}:/usr/bin:/bin'}):
+            # The alias never gains active-version priority; the fallback
+            # reports the actual trusted installation path instead.
+            self.assertEqual(self.resolve_without_fixed_path('codex'), links['codex'])
+
+    def test_dotdot_traversal_alias_into_trusted_install_never_wins(self):
+        _install, links = self.make_install('v22.23.1')
+        # Absolute, and resolves inside the trusted root, but the offered
+        # path itself is not a direct lexical child of it.
+        traversal_bin = self.root / '..' / 'node' / 'v22.23.1' / 'bin'
+        with patch.dict(os.environ, {'PATH': f'{traversal_bin}:/usr/bin'}):
+            self.assertEqual(self.resolve_without_fixed_path('codex'), links['codex'])
+
+    def test_relative_alias_into_trusted_install_never_wins(self):
+        _install, links = self.make_install('v22.23.1')
+        # A relative PATH entry that would resolve to the genuine NVM bin from
+        # the current working directory still never qualifies.
+        relative_bin = os.path.relpath(links['codex'].parent, Path.cwd())
+        self.assertFalse(Path(relative_bin).is_absolute())
+        with patch.dict(os.environ, {'PATH': f'{relative_bin}:/usr/bin'}):
+            self.assertEqual(self.resolve_without_fixed_path('codex'), links['codex'])
+        # A relative installation path is never a valid NVM install either.
+        self.assertIsNone(hosts._valid_nvm_install(Path('v22.23.1'), self.root))
+
     def test_installation_directory_symlink_escape_is_rejected(self):
         outside = Path(self.temp.name) / 'outside'
         outside.mkdir()
