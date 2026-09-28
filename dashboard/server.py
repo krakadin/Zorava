@@ -45,6 +45,26 @@ DEFAULT_HOST = '127.0.0.1'
 DEFAULT_PORT = 8787
 MAX_HTTP_BODY = 4096
 
+# A provider test only evidences current provider health for 24 hours. Older,
+# invalid, or future-dated evidence downgrades to explicit stale/not-tested
+# labels instead of the previous ambiguous UNKNOWN.
+TEST_FRESHNESS_SECONDS = 86400
+
+# Plain-text explanations rendered next to each status badge. Host cards say
+# "installed", never "verified": detection never reads host credentials and
+# never calls a provider.
+HOST_STATUS_DETAIL = {
+    'LOCAL': 'Installed locally on this machine; the provider connection and login are not tested by ai-worker.',
+    'NOT_INSTALLED': 'Not installed: the fixed host CLI name was not found on this machine.',
+}
+WORKER_STATUS_DETAIL = {
+    'READY': 'The last provider test passed within the past 24 hours.',
+    'TESTING': 'A provider test is queued or running right now.',
+    'AUTH_REQUIRED': 'The last provider test reported an authentication error; re-authenticate with the provider CLI, then click Test again.',
+    'NOT_TESTED': 'Configured but not yet tested; click Test to run the first provider check.',
+    'UNAVAILABLE': 'The local worker configuration could not be loaded; see the diagnostic. Past test history does not change this.',
+}
+
 
 class DashboardController:
     def __init__(self, runtime: Path = RUNTIME, port: int = DEFAULT_PORT, quota_cache=None,
@@ -156,13 +176,15 @@ class DashboardController:
         """Bounded cached detection metadata shared by the two host cards.
 
         Only hosts_snapshot() values are surfaced: resolved executable, the
-        bounded --version token, and the fixed delegation-skill path state. No
+        bounded --version token, and the fixed delegation-skill path state,
+        plus a fixed plain-text explanation of the detection status. No
         model, login, test, usage, or health value is invented here, and no
         host credential file is ever read.
         """
         host = host or {}
         return {'host': True, 'role': 'Host and controller',
                 'host_status': host.get('status'),
+                'status_detail': HOST_STATUS_DETAIL.get(host.get('status')),
                 'executable': host.get('executable'),
                 'version': host.get('version'),
                 'skill_path': host.get('skill_path'),
@@ -179,14 +201,18 @@ class DashboardController:
         usage = self.usage_snapshot()
         values = {}
         # The two host agents appear beside the managed workers, fed only by
-        # the cached local host snapshot. Claude keeps its existing
-        # model/routing fields; Codex reports detection metadata plus an
-        # honest OpenAI label, with auth/routing owned by its own CLI and no
-        # inferred health.
+        # the cached local host snapshot. Both take their badge from the same
+        # cached host detection metadata. Claude keeps its existing
+        # model/routing fields -- those describe configuration, not an
+        # installation or health signal; Codex reports detection metadata
+        # plus an honest OpenAI label, with auth/routing owned by its own CLI
+        # and no inferred health.
         host_by_id = {host['id']: host for host in self.hosts_snapshot()['hosts']}
         claude = dict(self.provider_snapshot['claude'])
-        claude.update(self._host_card_fields(host_by_id.get('claude-code')))
+        claude_host = host_by_id.get('claude-code') or {}
+        claude.update(self._host_card_fields(claude_host))
         claude['name'] = 'Claude Code'
+        claude['status'] = claude_host.get('status') or 'UNKNOWN'
         values['claude'] = claude
         codex_host = host_by_id.get('codex-cli') or {}
         codex = {'worker': 'codex', 'name': 'Codex CLI',
@@ -201,21 +227,56 @@ class DashboardController:
             tests = self.store.provider_tests(name, limit=1)
             last = tests[0] if tests else None
             status = info['status']
+            detail = None
+            configured = status == 'CONFIGURED'
             if last:
                 when = _parse_time(last.get('completed_at') or last.get('created_at'))
-                fresh = when is not None and (now - when).total_seconds() <= 86400
-                if last.get('status') in ('queued', 'running'): status = 'TESTING'
-                elif last.get('error_code') == 'AUTH_ERROR': status = 'AUTH_REQUIRED'
-                elif last.get('error_code') in ('RATE_LIMITED', 'QUOTA_OR_BILLING'): status = 'DEGRADED'
-                elif last.get('status') == 'completed' and fresh: status = 'READY'
-                elif fresh: status = 'DEGRADED'
-                elif status == 'CONFIGURED': status = 'UNKNOWN'
-            elif status == 'CONFIGURED':
-                status = 'UNKNOWN'
+                age = (now - when).total_seconds() if when is not None else None
+                # Only a real, past timestamp inside the 24-hour window counts
+                # as fresh; invalid or future timestamps never do.
+                fresh = age is not None and 0 <= age <= TEST_FRESHNESS_SECONDS
+                if last.get('status') in ('queued', 'running'):
+                    status = 'TESTING'
+                elif last.get('error_code') == 'AUTH_ERROR':
+                    status = 'AUTH_REQUIRED'
+                elif last.get('error_code') in ('RATE_LIMITED', 'QUOTA_OR_BILLING'):
+                    status = 'DEGRADED'
+                    detail = ('The last provider test reported a rate limit or quota/billing '
+                              'problem; do not repeatedly retry, and check the provider before '
+                              'testing again.')
+                elif last.get('status') == 'completed' and fresh:
+                    # A local UNAVAILABLE configuration is a live finding; test
+                    # history, fresh or old, must not relabel it READY.
+                    if configured:
+                        status = 'READY'
+                elif fresh:
+                    status = 'DEGRADED'
+                    detail = ('The last provider test failed within the past 24 hours; open the '
+                              'test job for details, then click Test to re-check.')
+                elif configured:
+                    # Old evidence is stated as old: never as current health
+                    # and never as a success it was not. An unparseable or
+                    # future timestamp is not old evidence at all, so it is
+                    # stated honestly instead of as a merely old test.
+                    status = 'TEST_STALE'
+                    if age is None or age < 0:
+                        detail = ('The last provider test timestamp is invalid or in the future, '
+                                  'so it cannot evidence current provider health. Click Test '
+                                  'again to run a new provider check.')
+                    else:
+                        detail = ('The last passed provider test is older than 24 hours; the worker '
+                                  'remains configured. Click Test to verify now.'
+                                  if last.get('status') == 'completed' else
+                                  'The last provider test is older than 24 hours and did not pass; '
+                                  'the worker remains configured. Click Test to verify now.')
+            elif configured:
+                status = 'NOT_TESTED'
             # The wrapper starts before its job is recorded in SQLite.
             if name in starting_workers:
                 status = 'TESTING'
+                detail = None
             info.update({'status': status,
+                         'status_detail': detail or WORKER_STATUS_DETAIL.get(status),
                          'last_test_id': last.get('id') if last else None,
                          'last_test_at': (last.get('completed_at') or last.get('created_at')) if last else None,
                          'last_test_completed_at': last.get('completed_at') if last else None,

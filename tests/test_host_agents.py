@@ -526,11 +526,18 @@ class HostApiTests(unittest.TestCase):
                                'last_test_status', 'queued_jobs', 'running_jobs'):
                     self.assertNotIn(absent, codex)
                 # Claude keeps its existing model/routing fields and gains the
-                # same cached local metadata.
+                # same cached local metadata. Its badge comes from the same
+                # host detection as Codex: installed locally, not a verified
+                # login or provider health signal.
                 claude = providers['claude']
                 self.assertEqual(claude['name'], 'Claude Code')
                 self.assertTrue(claude['host'])
                 self.assertEqual(claude['role'], 'Host and controller')
+                self.assertEqual(claude['status'], hosts.STATUS_LOCAL)
+                self.assertEqual(claude['host_status'], hosts.STATUS_LOCAL)
+                self.assertEqual(claude['status_detail'], codex['status_detail'])
+                self.assertIn('Installed locally', claude['status_detail'])
+                self.assertIn('not tested', claude['status_detail'])
                 self.assertEqual(claude['requested_model'], 'claude-local')
                 self.assertEqual(claude['routing'], 'DIRECT')
                 self.assertEqual(claude['provider'], 'Anthropic')
@@ -540,7 +547,7 @@ class HostApiTests(unittest.TestCase):
                                  '/home/krakadin/.claude/skills/delegate-workers/SKILL.md')
                 self.assertNotIn('separate worktree', claude['role'])
 
-    def test_providers_report_codex_missing_installation_honestly(self):
+    def test_providers_report_missing_host_installations_honestly_and_in_parity(self):
         with patch.object(hosts, 'resolve_executable', return_value=None), \
              patch.object(DashboardController, '_load_provider_snapshot',
                           return_value=self.safe_provider_snapshot()):
@@ -557,6 +564,16 @@ class HostApiTests(unittest.TestCase):
                 # The card is present but never faked as healthy or logged in.
                 self.assertNotIn('usage', codex)
                 self.assertNotIn('update_state', codex)
+                # Claude derives the same NOT_INSTALLED badge from the same
+                # cached detection while keeping its model/routing metadata.
+                claude = providers['claude']
+                self.assertEqual(claude['status'], hosts.STATUS_NOT_INSTALLED)
+                self.assertEqual(claude['host_status'], hosts.STATUS_NOT_INSTALLED)
+                self.assertIsNone(claude['executable'])
+                self.assertEqual(claude['status_detail'], codex['status_detail'])
+                self.assertIn('Not installed', claude['status_detail'])
+                self.assertEqual(claude['requested_model'], 'claude-local')
+                self.assertEqual(claude['routing'], 'DIRECT')
 
     def test_host_detection_is_cached_across_provider_polls(self):
         with patch.object(DashboardController, '_load_provider_snapshot',
@@ -657,6 +674,19 @@ class HostUiTests(unittest.TestCase):
         # Test/upgrade/usage actions stay gated on the two managed workers.
         self.assertIn("if (info.worker === 'qwen' || info.worker === 'kimi') {", self.js)
         self.assertIn("if (info.usage) card.append(usageSection(info));", self.js)
+
+    def test_host_statuses_render_as_human_labels_with_explanation(self):
+        # LOCAL/NOT_INSTALLED API values are preserved, but badges render as
+        # Installed/Not installed with a nearby explanation that installed is
+        # not a verified login or provider health signal.
+        self.assertIn("'LOCAL': 'Installed'", self.js)
+        self.assertIn("'NOT_INSTALLED': 'Not installed'", self.js)
+        self.assertIn('hostStatusDetail', self.js)
+        self.assertIn('host.status_detail || hostStatusDetail[host.status]', self.js)
+        self.assertIn("node('p',hostDetail,'status-detail')", self.js)
+        self.assertIn('.status-detail', self.css)
+        self.assertIn('textContent', self.js)
+        self.assertNotIn('innerHTML', self.js)
 
     def test_host_section_offers_no_action_and_no_post(self):
         self.assertNotIn("post('/api/v1/hosts", self.js)

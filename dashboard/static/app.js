@@ -96,7 +96,25 @@
     const s = Math.max(0, Math.floor(value / 1000));
     return `${String(Math.floor(s/60)).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
   };
-  const badge = status => node('span', (status || 'unknown').replaceAll('_',' '), `status status-${String(status||'unknown').toLowerCase()}`);
+  // Human-readable overrides for statuses whose raw API token would mislead.
+  // LOCAL means the host CLI was found on this machine -- nothing about login
+  // or provider health; TEST_STALE/NOT_TESTED describe test evidence age.
+  const statusLabels = {
+    'LOCAL': 'Installed',
+    'NOT_INSTALLED': 'Not installed',
+    'TEST_STALE': 'Test out of date',
+    'NOT_TESTED': 'Not tested'
+  };
+  const badge = status => {
+    const key = String(status || 'unknown');
+    return node('span', statusLabels[key] || key.replaceAll('_',' '), `status status-${key.toLowerCase()}`);
+  };
+  // Hosts-page explanation when the hosts API entry carries no status_detail;
+  // identical in spirit to the server's HOST_STATUS_DETAIL for provider cards.
+  const hostStatusDetail = {
+    'LOCAL': 'Installed locally; provider connection and login are not tested by ai-worker.',
+    'NOT_INSTALLED': 'Not installed: the fixed host CLI name was not found on this machine.'
+  };
   // CLI version metadata is read-only: the dashboard reports a pending upgrade
   // but never performs one. Labels come from this fixed map and are written with
   // textContent, so no fetched string is interpreted as markup.
@@ -209,6 +227,7 @@
     else if (checking) head.append(node('span','Checking for upgrades…','pill'));
     else if (isHost) head.append(node('span','Host agent','pill'));
     card.append(head);
+    if (info.status_detail) card.append(node('p',info.status_detail,'status-detail'));
     const dl=node('dl',undefined,'kv');
     addKV(dl,'Model',info.requested_model,true); addKV(dl,'Provider',info.provider);
     if (info.role) addKV(dl,'Role',isHost ? info.role : `${info.role} · separate worktree`);
@@ -338,6 +357,8 @@
     head.append(node('h2',host.name||'Host agent')); head.append(badge(host.status));
     head.append(node('span','Local host integration','pill'));
     card.append(head);
+    const hostDetail = host.status_detail || hostStatusDetail[host.status];
+    if (hostDetail) card.append(node('p',hostDetail,'status-detail'));
     const dl=node('dl',undefined,'kv');
     addKV(dl,'Role',host.role);
     addKV(dl,'Integration',host.integration);

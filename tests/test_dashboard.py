@@ -512,6 +512,129 @@ class DashboardTests(unittest.TestCase):
         with patch.dict(self.controller._test_processes,{'pending-test':('qwen',object())}):
             self.assert_provider_status('qwen','TESTING',None)
 
+    def backdate_job(self,job_id,*,completed_at=None,created_at=None):
+        with self.store.connect() as db:
+            if completed_at is not None:
+                db.execute('UPDATE jobs SET completed_at=? WHERE id=?',(completed_at,job_id))
+            if created_at is not None:
+                db.execute('UPDATE jobs SET created_at=? WHERE id=?',(created_at,job_id))
+
+    def test_configured_worker_without_a_test_is_not_tested(self):
+        for worker in ('qwen','kimi'):
+            with self.subTest(worker=worker):
+                for endpoint in ('/api/v1/providers','/api/v1/status'):
+                    status,_,body=self.request('GET',endpoint)
+                    self.assertEqual(status,200)
+                    info=json.loads(body)['providers'][worker]
+                    self.assertEqual(info['status'],'NOT_TESTED')
+                    self.assertIn('not yet tested',info['status_detail'])
+                    self.assertIsNone(info['last_test_at'])
+                    self.assertIsNone(info['last_success_at'])
+
+    def test_recent_coding_jobs_are_not_provider_test_evidence(self):
+        self.add_job()                    # completed delegation job for qwen
+        self.add_job(status='running')    # active work is not proof of login
+        for endpoint in ('/api/v1/providers','/api/v1/status'):
+            status,_,body=self.request('GET',endpoint)
+            self.assertEqual(status,200)
+            info=json.loads(body)['providers']['qwen']
+            self.assertEqual(info['status'],'NOT_TESTED')
+            self.assertEqual(info['running_jobs'],1)
+            self.assertIsNone(info['last_test_id'])
+
+    def test_stale_success_is_test_out_of_date_and_keeps_history(self):
+        job_id=self.add_provider_test('qwen')
+        self.store.finish_job(job_id,'completed',duration_ms=1,result='WORKER_OK')
+        self.backdate_job(job_id,created_at='2000-09-25T11:59:00+00:00',
+                          completed_at='2000-09-25T12:00:00+00:00')
+        status,_,body=self.request('GET','/api/v1/providers')
+        self.assertEqual(status,200)
+        info=json.loads(body)['providers']['qwen']
+        self.assertEqual(info['status'],'TEST_STALE')
+        self.assertIn('older than 24 hours',info['status_detail'])
+        self.assertIn('remains configured',info['status_detail'])
+        # The pass and its timestamp stay visible as history.
+        self.assertEqual(info['last_test_status'],'completed')
+        self.assertEqual(info['last_success_at'],'2000-09-25T12:00:00+00:00')
+
+    def test_stale_failure_is_test_out_of_date_without_claiming_success(self):
+        job_id=self.add_provider_test('kimi')
+        self.store.start_job(job_id,123,123,'fixture')
+        self.store.finish_job(job_id,'failed',duration_ms=1,error_code='WORKER_CRASH')
+        self.backdate_job(job_id,created_at='2000-09-25T11:59:00+00:00',
+                          completed_at='2000-09-25T12:00:00+00:00')
+        status,_,body=self.request('GET','/api/v1/providers')
+        self.assertEqual(status,200)
+        info=json.loads(body)['providers']['kimi']
+        self.assertEqual(info['status'],'TEST_STALE')
+        self.assertIn('older than 24 hours',info['status_detail'])
+        self.assertIn('did not pass',info['status_detail'])
+        self.assertIsNone(info['last_success_at'])
+
+    def test_invalid_and_future_test_timestamps_never_count_as_fresh(self):
+        invalid=self.add_provider_test('qwen')
+        self.store.finish_job(invalid,'completed',duration_ms=1,result='WORKER_OK')
+        self.backdate_job(invalid,completed_at='not-a-timestamp')
+        future=self.add_provider_test('kimi')
+        self.store.finish_job(future,'completed',duration_ms=1,result='WORKER_OK')
+        self.backdate_job(future,completed_at='2999-01-01T00:00:00+00:00')
+        status,_,body=self.request('GET','/api/v1/providers')
+        self.assertEqual(status,200)
+        providers=json.loads(body)['providers']
+        for worker in ('qwen','kimi'):
+            with self.subTest(worker=worker):
+                self.assertEqual(providers[worker]['status'],'TEST_STALE')
+                self.assertIn('invalid or in the future',providers[worker]['status_detail'])
+
+    def test_unavailable_worker_is_not_masked_by_test_history(self):
+        snapshot={key:dict(value) for key,value in self.safe_provider_snapshot.items()}
+        snapshot['kimi'].update({'status':'UNAVAILABLE','version':None,
+                                 'diagnostic':'fixture diagnostic'})
+        self.controller.provider_snapshot=snapshot
+        old=self.add_provider_test('kimi')
+        self.store.finish_job(old,'completed',duration_ms=1,result='WORKER_OK')
+        self.backdate_job(old,created_at='2000-09-25T11:59:00+00:00',
+                          completed_at='2000-09-25T12:00:00+00:00')
+        status,_,body=self.request('GET','/api/v1/providers')
+        info=json.loads(body)['providers']['kimi']
+        # Old success history cannot relabel a live configuration failure.
+        self.assertEqual(info['status'],'UNAVAILABLE')
+        self.assertIn('configuration',info['status_detail'])
+        # Neither can a fresh pass: the local configuration finding wins.
+        fresh=self.add_provider_test('kimi')
+        self.store.finish_job(fresh,'completed',duration_ms=1,result='WORKER_OK')
+        status,_,body=self.request('GET','/api/v1/providers')
+        info=json.loads(body)['providers']['kimi']
+        self.assertEqual(info['status'],'UNAVAILABLE')
+        self.assertEqual(info['diagnostic'],'fixture diagnostic')
+
+    def test_status_labels_survive_repeated_polling(self):
+        job_id=self.add_provider_test('qwen')
+        self.store.finish_job(job_id,'completed',duration_ms=1,result='WORKER_OK')
+        first=json.loads(self.request('GET','/api/v1/providers')[2])['providers']
+        second=json.loads(self.request('GET','/api/v1/providers')[2])['providers']
+        for name in ('claude','codex','qwen','kimi'):
+            self.assertEqual(first[name]['status'],second[name]['status'])
+            self.assertEqual(first[name].get('status_detail'),second[name].get('status_detail'))
+        self.assertEqual(first['qwen']['status'],'READY')
+        self.assertIn('within the past 24 hours',first['qwen']['status_detail'])
+        self.assertEqual(first['kimi']['status'],'NOT_TESTED')
+
+    def test_static_ui_renders_human_status_labels_and_explanations(self):
+        root=Path(__file__).resolve().parents[1]
+        js=(root/'dashboard/static/app.js').read_text(encoding='utf-8')
+        self.assertIn("'LOCAL': 'Installed'",js)
+        self.assertIn("'NOT_INSTALLED': 'Not installed'",js)
+        self.assertIn("'TEST_STALE': 'Test out of date'",js)
+        self.assertIn("'NOT_TESTED': 'Not tested'",js)
+        self.assertIn("node('p',info.status_detail,'status-detail')",js)
+        self.assertIn('hostStatusDetail',js)
+        self.assertIn('textContent',js);self.assertNotIn('innerHTML',js)
+        css=(root/'dashboard/static/dashboard.css').read_text(encoding='utf-8')
+        self.assertIn('.status-test_stale',css)
+        self.assertIn('.status-not_tested',css)
+        self.assertIn('.status-detail',css)
+
     def test_jobs_detail_logs_and_malformed_ids(self):
         job_id=self.add_job(result='<script>fake()</script>')
         status,_,body=self.request('GET','/api/v1/jobs')
@@ -747,8 +870,9 @@ class DashboardTests(unittest.TestCase):
         self.assertIsNotNone(info['last_update_check_at'])
         self.assertIsNone(info['last_update_success_at'])
         self.assertEqual(fetcher.calls,['qwen'])
-        # Provider test status is unchanged by version metadata.
-        self.assertEqual(info['status'],'UNKNOWN')
+        # Provider test status is unchanged by version metadata: a configured
+        # worker with no provider test is explicitly NOT_TESTED.
+        self.assertEqual(info['status'],'NOT_TESTED')
 
     def test_static_ui_shows_versions_and_an_explicit_upgrade_check(self):
         js=(Path(__file__).resolve().parents[1]/'dashboard/static/app.js').read_text(encoding='utf-8')
