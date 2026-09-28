@@ -49,6 +49,15 @@ class RecordingProbe:
 
 
 class HostDetectionTests(unittest.TestCase):
+    def setUp(self):
+        # Mock-only tests stay isolated from this machine's real NVM
+        # installation: the discovery fallback root is an empty temporary tree.
+        self.temp = tempfile.TemporaryDirectory(prefix='ai-router-nvm-empty-')
+        self.addCleanup(self.temp.cleanup)
+        patcher = patch.object(hosts, 'NVM_ROOT', Path(self.temp.name))
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_snapshot_reports_the_three_hosts_in_a_fixed_order(self):
         snapshot = hosts.detect_hosts(resolver=lambda name: None, probe=RecordingProbe())
         self.assertEqual([host['id'] for host in snapshot['hosts']],
@@ -201,6 +210,171 @@ class HostDetectionTests(unittest.TestCase):
             self.assertLessEqual(len(host['detail']), 400)
         for word in SECRET_WORDS:
             self.assertNotIn(word, raw.lower())
+
+
+class NvmHostDiscoveryTests(unittest.TestCase):
+    """NVM fallback discovery/probing against temporary installation trees.
+
+    These tests build realistic NVM layouts -- vMAJOR.MINOR.PATCH install
+    directories with bin/<name> npm symlinks into the install's own lib tree,
+    real file permissions, and fake version runners -- under a patched
+    ``hosts.NVM_ROOT`` so the machine's real NVM installation is never used.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='ai-router-nvm-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'versions' / 'node'
+        self.root.mkdir(parents=True)
+        patcher = patch.object(hosts, 'NVM_ROOT', self.root)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def make_install_at(self, base, version, names=('codex',), mode=0o755):
+        """Realistic npm layout: bin/<name> symlinks into the install lib tree."""
+        install = Path(base) / version
+        target_dir = install / 'lib' / 'node_modules' / '@fake' / 'hostcli' / 'bin'
+        target_dir.mkdir(parents=True)
+        bin_dir = install / 'bin'
+        bin_dir.mkdir(exist_ok=True)
+        links = {}
+        for name in names:
+            target = target_dir / f'{name}.js'
+            target.write_text('#!/usr/bin/env node\nconsole.log("fake")\n', encoding='utf-8')
+            os.chmod(target, mode)
+            link = bin_dir / name
+            link.symlink_to(os.path.relpath(target, bin_dir))
+            links[name] = link
+        return install, links
+
+    def make_install(self, version, names=('codex',), mode=0o755):
+        return self.make_install_at(self.root, version, names, mode)
+
+    def resolve_without_fixed_path(self, name):
+        with patch.object(hosts.shutil, 'which', return_value=None):
+            return hosts.resolve_executable(name)
+
+    def test_fixed_path_precedence_over_nvm_installations(self):
+        self.make_install('v22.23.1')
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            with patch.object(hosts.shutil, 'which', return_value='/usr/local/bin/codex'):
+                self.assertEqual(hosts.resolve_executable('codex'), Path('/usr/local/bin/codex'))
+
+    def test_discovery_without_nvm_on_path_uses_npm_symlink(self):
+        _install, links = self.make_install('v22.23.1')
+        with patch.dict(os.environ, {'PATH': '/usr/local/bin:/usr/bin:/bin'}):
+            # The reported executable is the normal npm bin symlink inside the
+            # installation; no specific Node version is hardcoded anywhere.
+            self.assertEqual(self.resolve_without_fixed_path('codex'), links['codex'])
+            self.assertEqual(os.readlink(links['codex']),
+                             os.path.join('..', 'lib', 'node_modules', '@fake',
+                                          'hostcli', 'bin', 'codex.js'))
+            self.assertIsNone(self.resolve_without_fixed_path('claude'))
+
+    def test_highest_numeric_node_version_wins(self):
+        self.make_install('v22.9.0')
+        _newer_install, newer = self.make_install('v22.10.0')
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            # Numeric, not lexical: v22.10.0 beats v22.9.0.
+            self.assertEqual(self.resolve_without_fixed_path('codex'), newer['codex'])
+
+    def test_active_validated_nvm_bin_is_preferred(self):
+        _older_install, older = self.make_install('v22.9.0')
+        self.make_install('v22.10.0')
+        active = f'{older["codex"].parent}{os.pathsep}/usr/bin:/bin'
+        with patch.dict(os.environ, {'PATH': active}):
+            # The active NVM bin on PATH wins over a higher installed version.
+            self.assertEqual(self.resolve_without_fixed_path('codex'), older['codex'])
+
+    def test_missing_nonexecutable_and_misnamed_installs_are_skipped(self):
+        self.make_install('v22.11.0', mode=0o644)          # not executable
+        empty = self.root / 'v22.12.0'
+        (empty / 'bin').mkdir(parents=True)                 # no codex at all
+        (self.root / 'latest').mkdir()                      # not vMAJOR.MINOR.PATCH
+        (self.root / 'v22').mkdir()
+        (self.root / 'not-a-version').mkdir()
+        _usable_install, usable = self.make_install('v22.8.0')
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            self.assertEqual(self.resolve_without_fixed_path('codex'), usable['codex'])
+
+    def test_arbitrary_inherited_path_directories_are_never_searched(self):
+        elsewhere = Path(self.temp.name) / 'elsewhere'
+        elsewhere.mkdir()
+        fake = elsewhere / 'codex'
+        fake.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        os.chmod(fake, 0o755)
+        with patch.dict(os.environ, {'PATH': f'{elsewhere}:/usr/bin:/bin'}):
+            self.assertIsNone(self.resolve_without_fixed_path('codex'))
+            self.assertIsNone(self.resolve_without_fixed_path('claude'))
+
+    def test_installation_directory_symlink_escape_is_rejected(self):
+        outside = Path(self.temp.name) / 'outside'
+        outside.mkdir()
+        self.make_install_at(outside, 'v22.23.1')
+        (self.root / 'v22.23.1').symlink_to(outside / 'v22.23.1', target_is_directory=True)
+        escaped_bin = self.root / 'v22.23.1' / 'bin'
+        with patch.dict(os.environ, {'PATH': f'{escaped_bin}:/usr/bin:/bin'}):
+            # Rejected both as an active PATH bin and as a discovered install.
+            self.assertIsNone(self.resolve_without_fixed_path('codex'))
+
+    def test_executable_symlink_escaping_the_install_is_rejected(self):
+        bin_dir = self.root / 'v22.23.1' / 'bin'
+        bin_dir.mkdir(parents=True)
+        evil = Path(self.temp.name) / 'evil-codex'
+        evil.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        os.chmod(evil, 0o755)
+        (bin_dir / 'codex').symlink_to(evil)
+        with patch.dict(os.environ, {'PATH': f'{bin_dir}:/usr/bin:/bin'}):
+            self.assertIsNone(self.resolve_without_fixed_path('codex'))
+
+    def test_bin_directory_symlink_escaping_the_install_is_rejected(self):
+        install = self.root / 'v22.23.1'
+        install.mkdir()
+        outside_bin = Path(self.temp.name) / 'outside-bin'
+        outside_bin.mkdir()
+        target = outside_bin / 'codex'
+        target.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        os.chmod(target, 0o755)
+        (install / 'bin').symlink_to(outside_bin, target_is_directory=True)
+        with patch.dict(os.environ, {'PATH': '/usr/bin:/bin'}):
+            self.assertIsNone(self.resolve_without_fixed_path('codex'))
+
+    def test_nvm_probe_prepends_only_the_validated_nvm_bin(self):
+        _install, links = self.make_install('v22.23.1')
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append((command, kwargs))
+            return FakeCompleted(b'codex-cli 0.157.1\n')
+
+        version = hosts.probe_host_version(links['codex'], runner=runner)
+        self.assertEqual(version, '0.157.1')
+        command, kwargs = calls[0]
+        self.assertEqual(command, [str(links['codex']), '--version'])
+        # Only the validated NVM bin precedes the unchanged fixed base PATH, so
+        # #!/usr/bin/env node resolves to this installation's own runtime.
+        self.assertEqual(kwargs['env']['PATH'],
+                         f"{links['codex'].parent}{os.pathsep}{hosts.SEARCH_PATH}")
+        self.assertEqual(kwargs['timeout'], hosts.PROBE_TIMEOUT_SECONDS)
+
+    def test_probe_keeps_the_base_path_for_an_untrusted_nvm_executable(self):
+        bin_dir = self.root / 'v22.23.1' / 'bin'
+        bin_dir.mkdir(parents=True)
+        evil = Path(self.temp.name) / 'evil-codex'
+        evil.write_text('#!/bin/sh\nexit 1\n', encoding='utf-8')
+        os.chmod(evil, 0o755)
+        link = bin_dir / 'codex'
+        link.symlink_to(evil)
+        calls = []
+
+        def runner(command, **kwargs):
+            calls.append(kwargs)
+            return FakeCompleted(b'codex-cli 9.9.9\n')
+
+        version = hosts.probe_host_version(link, runner=runner)
+        self.assertEqual(version, '9.9.9')
+        # The escaping symlink never earns an NVM PATH entry.
+        self.assertEqual(calls[0]['env']['PATH'], hosts.SEARCH_PATH)
 
 
 class HostApiTests(unittest.TestCase):

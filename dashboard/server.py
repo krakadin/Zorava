@@ -68,8 +68,9 @@ class DashboardController:
         # Host/controller agents (Claude Code, the Codex CLI, and the planned
         # ChatGPT-hosted controller) are reported separately from managed
         # workers. Detection stays local: two fixed executable names inside a
-        # fixed PATH allowlist, one bounded --version probe per resolved host,
-        # and two fixed skill-path existence checks. No host credential, OAuth,
+        # fixed PATH allowlist with a validated NVM installation fallback under
+        # the fixed ~/.nvm/versions/node root, one bounded --version probe per
+        # resolved host, and two fixed skill-path existence checks. No host credential, OAuth,
         # or token file is read and no provider or network call is made. The
         # probe is injectable so tests never spawn a host CLI.
         self.host_probe = probe_host_version if host_probe is None else host_probe
@@ -206,8 +207,10 @@ class DashboardController:
         """Cached local view of the host/controller agents; never a provider call.
 
         The first call resolves two fixed executable names inside a fixed PATH
-        allowlist, runs at most one bounded ``--version`` probe per resolved host
-        CLI, and checks two fixed delegation-skill paths. Later calls reuse the
+        allowlist (falling back to validated NVM installations under the fixed
+        ~/.nvm/versions/node root when the fixed PATH has no match), runs at
+        most one bounded ``--version`` probe per resolved host CLI, and checks
+        two fixed delegation-skill paths. Later calls reuse the
         cached snapshot, so dashboard GETs and polling stay local and cheap. No
         host credential file is read and nothing here can be parameterized by a
         request, a job, or repository content.
@@ -572,7 +575,8 @@ def make_handler(controller: DashboardController):
                     self._json({'providers':controller.providers()}); return
                 if path == '/api/v1/hosts':
                     # Local host/controller metadata only: fixed executable names
-                    # inside a fixed PATH allowlist, fixed skill paths, no host
+                    # inside a fixed PATH allowlist plus a validated NVM fallback
+                    # under the fixed NVM root, fixed skill paths, no host
                     # credential file, and no provider or network call. Cached
                     # after the first read, so polling stays local and cheap.
                     self._json(controller.hosts_snapshot()); return

@@ -12,9 +12,22 @@ What this module is allowed to look at, and nothing more:
   inside the fixed ``SEARCH_PATH`` allowlist (the same reviewed PATH that worker
   children receive). No caller-supplied name, argument, or path is accepted, so
   a delegated repository can never select or run an executable of its own.
+* only when the fixed PATH has no match, the same fixed names discovered under
+  the fixed trusted NVM root ``/home/krakadin/.nvm/versions/node``: just
+  ``vMAJOR.MINOR.PATCH`` installation directories and the allowlisted host
+  names qualify, an active NVM bin from the inherited PATH is preferred solely
+  after it validates as such, and otherwise the highest numeric installed Node
+  version with the executable is chosen. Installation, bin, and executable
+  paths are resolved and must stay inside the installation, so normal npm bin
+  symlinks into its own ``lib`` tree work while directory or executable
+  symlinks escaping it are rejected. Arbitrary inherited PATH entries and
+  project directories are never searched.
 * at most one bounded ``<resolved executable> --version`` probe per local host,
   with a sanitized environment, no stdin, a short timeout, and a short parsed
-  version token as the only retained output.
+  version token as the only retained output. An NVM-resolved host additionally
+  gets only its own validated NVM bin prepended to the sanitized PATH, so its
+  ``#!/usr/bin/env node`` shebang uses the matching runtime; every other
+  executable keeps the fixed base PATH unchanged.
 * ``Path.is_file()`` existence checks of the two fixed delegation-skill paths.
 
 Skill *content* is never read, and no Claude or Codex credential, OAuth, or
@@ -28,6 +41,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+import os
 import re
 import shutil
 import subprocess
@@ -39,6 +53,11 @@ PROJECT = Path(__file__).resolve().parents[1]
 # Fixed search path, identical to the one worker children get: a same-named
 # executable inside a delegated repository can never be resolved or probed.
 SEARCH_PATH = '/home/krakadin/.local/bin:/usr/local/bin:/usr/bin:/bin'
+# Fixed trusted NVM root, consulted only when SEARCH_PATH has no match. No
+# specific Node version is ever assumed; discovered vMAJOR.MINOR.PATCH
+# installation directories are validated before use.
+NVM_ROOT = Path('/home/krakadin/.nvm/versions/node')
+_NVM_VERSION_DIR = re.compile(r'v(\d+)\.(\d+)\.(\d+)')
 PROBE_TIMEOUT_SECONDS = 5.0
 MAX_OUTPUT_BYTES = 512
 MAX_VERSION_LENGTH = 40
@@ -105,12 +124,167 @@ HOSTS = (
 ALLOWED_EXECUTABLES = frozenset(spec.executable_name for spec in HOSTS if spec.executable_name)
 
 
-def resolve_executable(name):
-    """Resolve a fixed host executable name inside SEARCH_PATH; None when absent.
+def _resolved(path):
+    """Fully resolved path; None when resolution itself fails (loop, error)."""
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError):
+        return None
 
-    Names outside ``ALLOWED_EXECUTABLES`` are refused without any lookup, and the
-    search path is a constant: neither a request, a job, nor repository content
-    can choose what is resolved.
+
+def _inside(child, parent):
+    """True when an already resolved ``child`` lies inside ``parent``."""
+    try:
+        Path(child).relative_to(parent)
+        return True
+    except (TypeError, ValueError):
+        return False
+
+
+def _valid_nvm_install(install, root=None):
+    """(version tuple, resolved install) for a genuine NVM installation dir.
+
+    Only ``vMAJOR.MINOR.PATCH`` directory names qualify, and the directory
+    itself must resolve directly beneath the fixed NVM root, so a symlinked
+    installation directory escaping the root is rejected. Anything else --
+    non-directories, missing entries, other names -- returns None.
+    """
+    root = NVM_ROOT if root is None else Path(root)
+    install = Path(install)
+    match = _NVM_VERSION_DIR.fullmatch(install.name)
+    if match is None:
+        return None
+    resolved_root = _resolved(root)
+    resolved_install = _resolved(install)
+    if resolved_root is None or resolved_install is None:
+        return None
+    if resolved_install.parent != resolved_root:
+        return None
+    try:
+        if not install.is_dir():
+            return None
+    except OSError:
+        return None
+    return tuple(int(part) for part in match.groups()), resolved_install
+
+
+def _valid_nvm_executable(name, install, resolved_install):
+    """(bin dir, executable) for ``name`` inside a validated NVM install.
+
+    The bin directory and the executable must both resolve inside the
+    installation: a normal npm bin symlink into the installation's own ``lib``
+    tree resolves there and qualifies, while directory or executable symlinks
+    escaping the installation are rejected. The executable must additionally
+    be an executable regular file. Any failure returns None.
+    """
+    bin_dir = Path(install) / 'bin'
+    executable = bin_dir / name
+    resolved_bin = _resolved(bin_dir)
+    resolved_exe = _resolved(executable)
+    if resolved_bin is None or resolved_exe is None:
+        return None
+    if not _inside(resolved_bin, resolved_install):
+        return None
+    if not _inside(resolved_exe, resolved_install):
+        return None
+    try:
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            return None
+    except OSError:
+        return None
+    return bin_dir, executable
+
+
+def _active_nvm_executable(name, root=None):
+    """Executable from an active NVM bin on the inherited PATH, when valid.
+
+    A PATH entry qualifies only when it validates as the ``bin`` directory of
+    a genuine NVM installation under the fixed root; every other inherited
+    PATH entry is ignored and never searched.
+    """
+    path = os.environ.get('PATH')
+    if not path:
+        return None
+    for entry in path.split(os.pathsep):
+        if not entry:
+            continue
+        bin_dir = Path(entry)
+        if bin_dir.name != 'bin':
+            continue
+        validated = _valid_nvm_install(bin_dir.parent, root)
+        if validated is None:
+            continue
+        offered = _valid_nvm_executable(name, bin_dir.parent, validated[1])
+        if offered is not None:
+            return offered[1]
+    return None
+
+
+def _nvm_candidates(name, root=None):
+    """Every validated NVM installation offering ``name``.
+
+    Each entry is ``(version tuple, install dir, bin dir, executable)``. Only
+    ``vMAJOR.MINOR.PATCH`` directories beneath the fixed root that pass the
+    symlink-containment and executability checks qualify.
+    """
+    root = NVM_ROOT if root is None else Path(root)
+    candidates = []
+    try:
+        entries = sorted(Path(root).iterdir())
+    except OSError:
+        return candidates
+    for install in entries:
+        validated = _valid_nvm_install(install, root)
+        if validated is None:
+            continue
+        offered = _valid_nvm_executable(name, install, validated[1])
+        if offered is not None:
+            candidates.append((validated[0], install, offered[0], offered[1]))
+    return candidates
+
+
+def _nvm_executable(name, root=None):
+    """NVM fallback for one allowlisted name; None when nothing validates.
+
+    An active NVM bin from the inherited PATH is preferred only after it
+    validates as such; otherwise the highest numeric installed Node version
+    with the executable is chosen, so the result stays deterministic.
+    """
+    active = _active_nvm_executable(name, root)
+    if active is not None:
+        return active
+    candidates = _nvm_candidates(name, root)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda candidate: candidate[0])[3]
+
+
+def _nvm_bin_for(executable, root=None):
+    """Validated NVM bin dir of an NVM-resolved executable; None otherwise."""
+    try:
+        path = Path(executable)
+    except TypeError:
+        return None
+    if path.parent.name != 'bin':
+        return None
+    install = path.parent.parent
+    validated = _valid_nvm_install(install, root)
+    if validated is None:
+        return None
+    offered = _valid_nvm_executable(path.name, install, validated[1])
+    if offered is None or offered[1] != path:
+        return None
+    return path.parent
+
+
+def resolve_executable(name):
+    """Resolve a fixed host executable name; None when absent or untrusted.
+
+    Names outside ``ALLOWED_EXECUTABLES`` are refused without any lookup. The
+    fixed ``SEARCH_PATH`` keeps its precedence; only when no executable is
+    found there does the validated NVM fallback under ``NVM_ROOT`` apply.
+    Neither a request, a job, nor repository content can choose what is
+    resolved.
     """
     if not isinstance(name, str) or name not in ALLOWED_EXECUTABLES:
         return None
@@ -118,21 +292,32 @@ def resolve_executable(name):
         found = shutil.which(name, path=SEARCH_PATH)
     except (OSError, ValueError):
         return None
-    return Path(found) if isinstance(found, str) and found else None
+    if isinstance(found, str) and found:
+        return Path(found)
+    return _nvm_executable(name)
 
 
 def probe_host_version(executable, runner=subprocess.run):
     """Bounded local ``--version`` text for an already resolved host executable.
 
     Only the resolved fixed path is executed, only with ``--version``, and only a
-    short parsed version token survives. Every failure becomes None: no exception
-    text, environment value, or raw CLI output is returned, cached, or shown.
+    short parsed version token survives. An NVM-resolved executable gets only
+    its own validated NVM bin prepended to the sanitized PATH so its
+    ``#!/usr/bin/env node`` shebang uses the matching runtime; every other
+    executable keeps the fixed base PATH unchanged. Every failure becomes None:
+    no exception text, environment value, or raw CLI output is returned,
+    cached, or shown.
     """
     if executable is None:
         return None
+    env = common_child_environment()
+    nvm_bin = _nvm_bin_for(executable)
+    if nvm_bin is not None:
+        # Prepend only this validated NVM bin; the base PATH is untouched.
+        env['PATH'] = f'{nvm_bin}{os.pathsep}{env["PATH"]}'
     try:
         proc = runner([str(Path(executable)), '--version'], cwd='/home/krakadin',
-                      env=common_child_environment(), stdin=subprocess.DEVNULL,
+                      env=env, stdin=subprocess.DEVNULL,
                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                       timeout=PROBE_TIMEOUT_SECONDS, check=False)
     except (OSError, ValueError, subprocess.SubprocessError):
