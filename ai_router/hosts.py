@@ -1,10 +1,11 @@
 """Local-only metadata for the host/controller agents that drive Zorava.
 
-Host agents -- Claude Code and the Codex CLI today, with a ChatGPT-hosted
-controller on the roadmap -- own the conversation, delegate bounded jobs to the
-managed Qwen/Kimi workers, and review what comes back. They are *not* workers:
-Zorava never launches, tests, or calls a host agent, and no host provider
-traffic passes through this repository.
+Host agents -- Claude Code and the Codex CLI -- own the conversation, delegate
+bounded jobs to the managed Qwen/Kimi workers, and review what comes back.
+They are *not* workers: Zorava never launches, tests, or calls a host agent,
+and no host provider traffic passes through this repository. A hosted ChatGPT
+controller remains a documentation-roadmap idea only; it intentionally has no
+entry in this module.
 
 What this module is allowed to look at, and nothing more:
 
@@ -71,11 +72,9 @@ _VERSION = re.compile(r'\d+\.\d+(?:\.\d+)?')
 # particular no host session, login, or provider health is inferred.
 STATUS_LOCAL = 'LOCAL'
 STATUS_NOT_INSTALLED = 'NOT_INSTALLED'
-STATUS_ROADMAP = 'ROADMAP'
-HOST_STATUSES = (STATUS_LOCAL, STATUS_NOT_INSTALLED, STATUS_ROADMAP)
+HOST_STATUSES = (STATUS_LOCAL, STATUS_NOT_INSTALLED)
 
 KIND_LOCAL_CLI = 'local-cli'
-KIND_HOSTED = 'hosted'
 
 CLAUDE_SKILL_PATH = Path('/home/krakadin/.claude/skills/delegate-workers/SKILL.md')
 CODEX_SKILL_PATH = PROJECT / '.agents' / 'skills' / 'delegate-workers' / 'SKILL.md'
@@ -114,13 +113,8 @@ HOSTS = (
              'Local CLI host', 'codex', CODEX_SKILL_PATH,
              'Runs on this machine inside a checkout of this repository and delegates through '
              'the repository skill at .agents/skills/delegate-workers/SKILL.md. Codex keeps its '
-             'own ChatGPT/OpenAI login; nothing is written to ~/.codex and this entry does not '
-             'imply a hosted ChatGPT session.'),
-    HostSpec('chatgpt-hosted', 'ChatGPT-hosted controller', 'Host and controller (planned)',
-             KIND_HOSTED, 'Hosted controller (roadmap)', None, None,
-             'ROADMAP: a hosted ChatGPT controller integration is planned. There is no local '
-             'executable, no credential, and no hosted session behind this entry, so it is '
-             'reported as unavailable rather than as something this machine already runs.'),
+             'own ChatGPT/OpenAI login; nothing is written to ~/.codex and no host session, '
+             'login, or provider health is inferred from this entry.'),
 )
 
 # The only executable names this module can ever resolve or probe.
@@ -355,14 +349,9 @@ def host_entry(spec, resolver=None, probe=None):
     resolve = resolver if resolver is not None else resolve_executable
     probe_version = probe if probe is not None else probe_host_version
     state = skill_state(spec.skill_path)
-    if spec.kind == KIND_HOSTED:
-        # Nothing to resolve and nothing to probe: this entry exists to report a
-        # planned integration honestly instead of inventing a local executable.
-        executable, version, status = None, None, STATUS_ROADMAP
-    else:
-        executable = resolve(spec.executable_name)
-        version = probe_version(executable) if executable is not None else None
-        status = STATUS_LOCAL if executable is not None else STATUS_NOT_INSTALLED
+    executable = resolve(spec.executable_name)
+    version = probe_version(executable) if executable is not None else None
+    status = STATUS_LOCAL if executable is not None else STATUS_NOT_INSTALLED
     return {'id': spec.host_id, 'name': spec.name, 'role': spec.role,
             'kind': spec.kind, 'integration': spec.integration, 'status': status,
             'executable': str(executable) if executable is not None else None,

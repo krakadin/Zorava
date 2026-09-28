@@ -65,12 +65,12 @@ class DashboardController:
         # Cached, read-only CLI version metadata. It is only ever refreshed by
         # an explicit operator action; dashboard GETs stay offline.
         self.updates = UpdateRegistry()
-        # Host/controller agents (Claude Code, the Codex CLI, and the planned
-        # ChatGPT-hosted controller) are reported separately from managed
-        # workers. Detection stays local: two fixed executable names inside a
-        # fixed PATH allowlist with a validated NVM installation fallback under
-        # the fixed ~/.nvm/versions/node root, one bounded --version probe per
-        # resolved host, and two fixed skill-path existence checks. No host credential, OAuth,
+        # Host/controller agents (Claude Code and the Codex CLI) are reported
+        # separately from managed workers. Detection stays local: two fixed
+        # executable names inside a fixed PATH allowlist with a validated NVM
+        # installation fallback under the fixed ~/.nvm/versions/node root, one
+        # bounded --version probe per resolved host, and two fixed skill-path
+        # existence checks. No host credential, OAuth,
         # or token file is read and no provider or network call is made. The
         # probe is injectable so tests never spawn a host CLI.
         self.host_probe = probe_host_version if host_probe is None else host_probe
@@ -152,6 +152,23 @@ class DashboardController:
             catalog[name] = {'selected': selected, 'available': options}
         return catalog
 
+    def _host_card_fields(self, host):
+        """Bounded cached detection metadata shared by the two host cards.
+
+        Only hosts_snapshot() values are surfaced: resolved executable, the
+        bounded --version token, and the fixed delegation-skill path state. No
+        model, login, test, usage, or health value is invented here, and no
+        host credential file is ever read.
+        """
+        host = host or {}
+        return {'host': True, 'role': 'Host and controller',
+                'host_status': host.get('status'),
+                'executable': host.get('executable'),
+                'version': host.get('version'),
+                'skill_path': host.get('skill_path'),
+                'skill_state': host.get('skill_state'),
+                'detail': host.get('detail')}
+
     def providers(self):
         if self.provider_snapshot is None:
             self.provider_snapshot = self._load_provider_snapshot()
@@ -161,6 +178,24 @@ class DashboardController:
         activity = self.store.worker_activity()
         usage = self.usage_snapshot()
         values = {}
+        # The two host agents appear beside the managed workers, fed only by
+        # the cached local host snapshot. Claude keeps its existing
+        # model/routing fields; Codex reports detection metadata plus an
+        # honest OpenAI label, with auth/routing owned by its own CLI and no
+        # inferred health.
+        host_by_id = {host['id']: host for host in self.hosts_snapshot()['hosts']}
+        claude = dict(self.provider_snapshot['claude'])
+        claude.update(self._host_card_fields(host_by_id.get('claude-code')))
+        claude['name'] = 'Claude Code'
+        values['claude'] = claude
+        codex_host = host_by_id.get('codex-cli') or {}
+        codex = {'worker': 'codex', 'name': 'Codex CLI',
+                 'status': codex_host.get('status') or 'UNKNOWN',
+                 'requested_model': None, 'provider': 'OpenAI',
+                 'authentication': 'Managed by the Codex CLI login; not read or tested by ai-worker',
+                 'routing': 'Managed by the Codex CLI; ai-worker infers no session or health'}
+        codex.update(self._host_card_fields(codex_host))
+        values['codex'] = codex
         for name in ('qwen', 'kimi'):
             info = dict(self.provider_snapshot[name])
             tests = self.store.provider_tests(name, limit=1)
@@ -200,7 +235,6 @@ class DashboardController:
             info['usage']['job_tokens'] = dict(usage['job_token_totals'][name],
                                                scope=usage['job_token_totals']['scope'])
             values[name] = info
-        values['claude'] = self.provider_snapshot['claude']
         return values
 
     def hosts_snapshot(self) -> dict:

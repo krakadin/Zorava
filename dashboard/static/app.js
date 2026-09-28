@@ -8,6 +8,10 @@
   // Workers with an operator-requested CLI version check in flight. Like the
   // test set, it only drives label/disabled state; it never starts a check.
   const pendingUpdates = new Set();
+  // The single shared display order for the provider/host cards: two host
+  // agents (Claude Code, Codex CLI) followed by the two managed coding
+  // workers (Qwen, Kimi). Initial page renders and every refresh path use it.
+  const PROVIDER_ORDER=['claude','codex','qwen','kimi'];
   const navPage = jobId ? 'jobs' : page;
   document.querySelectorAll('[data-nav]').forEach(link => {
     if (link.dataset.nav === navPage) link.classList.add('active');
@@ -194,15 +198,24 @@
   function providerCard(info) {
     const testing = info.status === 'TESTING' || pendingTests.has(info.worker);
     const checking = info.update_checking === true || pendingUpdates.has(info.worker);
-    const card=node('article',undefined,'card');
+    // Host agents (Claude Code, Codex CLI) are controllers, not managed
+    // workers: their cards show cached local detection metadata only and get
+    // no test/upgrade buttons, no quota rows, and no capacity rows.
+    const isHost = info.host === true;
+    const card=node('article',undefined,isHost?'card host-card':'card');
     const head=node('div',undefined,'card-head');
-    head.append(node('h2',(info.worker || '').toUpperCase())); head.append(badge(testing ? 'TESTING' : info.status));
+    head.append(node('h2',info.name || (info.worker || '').toUpperCase())); head.append(badge(testing ? 'TESTING' : info.status));
     if (info.update_state === 'update-available') head.append(node('span',`Upgrade pending · ${info.latest_version}`,'pill upgrade-pill'));
     else if (checking) head.append(node('span','Checking for upgrades…','pill'));
+    else if (isHost) head.append(node('span','Host agent','pill'));
     card.append(head);
     const dl=node('dl',undefined,'kv');
     addKV(dl,'Model',info.requested_model,true); addKV(dl,'Provider',info.provider);
-    if (info.role) addKV(dl,'Role',`${info.role} · separate worktree`);
+    if (info.role) addKV(dl,'Role',isHost ? info.role : `${info.role} · separate worktree`);
+    if (isHost) {
+      addKV(dl,'Executable',info.executable || 'Not detected on this machine',true);
+      addKV(dl,'Delegation skill',info.skill_path ? `${info.skill_path} · ${info.skill_state}` : (info.skill_state || 'Unknown'),true);
+    }
     if (info.concurrency != null) {
       addKV(dl,'Capacity',`${info.concurrency} concurrent job${info.concurrency===1?'':'s'}`);
       addKV(dl,'Active jobs',`running ${info.running_jobs ?? 0} · queued ${info.queued_jobs ?? 0}`);
@@ -219,10 +232,13 @@
       if (info.last_update_error) addKV(dl,'Check error',info.last_update_error);
       if (info.update_source) addKV(dl,'Version source',info.update_source,true);
     } else if (info.version) addKV(dl,'CLI version',info.version,true);
-    addKV(dl,'Last test',info.last_test_at ? `${displayTime(info.last_test_at)} · ${info.last_test_status}` : 'Not tested');
-    if (info.last_success_at) addKV(dl,'Last passed',displayTime(info.last_success_at));
-    if (info.last_test_error) addKV(dl,'Test error',info.last_test_error);
+    if (!isHost) {
+      addKV(dl,'Last test',info.last_test_at ? `${displayTime(info.last_test_at)} · ${info.last_test_status}` : 'Not tested');
+      if (info.last_success_at) addKV(dl,'Last passed',displayTime(info.last_success_at));
+      if (info.last_test_error) addKV(dl,'Test error',info.last_test_error);
+    }
     card.append(dl);
+    if (isHost && info.detail) card.append(node('p',info.detail,'prose'));
     if (info.usage) card.append(usageSection(info));
     if (info.worker === 'qwen' || info.worker === 'kimi') {
       const actions=node('div',undefined,'provider-actions');
@@ -248,7 +264,7 @@
   async function refreshProviderCards() {
     const data=await get('/api/v1/providers');
     const cards=document.querySelector('#provider-cards');
-    if (cards) cards.replaceChildren(...['claude','qwen','kimi'].map(name=>providerCard(data.providers[name])));
+    if (cards) cards.replaceChildren(...PROVIDER_ORDER.map(name=>providerCard(data.providers[name])));
   }
   async function followTest(worker, jobId) {
     const deadline=Date.now()+160000;
@@ -317,16 +333,15 @@
   // paths), so this section has no action, no POST, and never reads a host
   // credential or calls a host.
   function hostCard(host) {
-    const roadmap = host.status === 'ROADMAP';
-    const card=node('article',undefined,`card host-card${roadmap ? ' host-roadmap' : ''}`);
+    const card=node('article',undefined,'card host-card');
     const head=node('div',undefined,'card-head');
     head.append(node('h2',host.name||'Host agent')); head.append(badge(host.status));
-    head.append(node('span',roadmap ? 'Planned hosted controller' : 'Local host integration','pill'));
+    head.append(node('span','Local host integration','pill'));
     card.append(head);
     const dl=node('dl',undefined,'kv');
     addKV(dl,'Role',host.role);
     addKV(dl,'Integration',host.integration);
-    addKV(dl,'Executable',host.executable || (roadmap ? 'None · hosted integration is planned' : 'Not detected on this machine'),true);
+    addKV(dl,'Executable',host.executable || 'Not detected on this machine',true);
     addKV(dl,'Version',host.version || 'Unknown',true);
     addKV(dl,'Delegation skill',host.skill_path ? `${host.skill_path} · ${host.skill_state}` : host.skill_state,true);
     addKV(dl,'Host credentials',host.credentials);
@@ -335,39 +350,23 @@
     return card;
   }
 
-  function hostSummary(data) {
-    const box=panel('HOST AGENTS');
-    const dl=node('dl',undefined,'kv');
-    (data.hosts||[]).forEach(host=>{
-      const state=host.status==='ROADMAP'
-        ? 'Roadmap · hosted integration planned; nothing installed here'
-        : `${host.integration}${host.version?` · ${host.version}`:''} · skill ${(host.skill_state||'').toLowerCase()}`;
-      addKV(dl,host.name,state);
-    });
-    box.append(dl);
-    box.append(node('p',data.note||'Local host metadata only; host credentials are never read.','notice'));
-    return box;
-  }
-
   async function hostsPage() {
-    title('Host agents','Host/controller agents that delegate to the managed Qwen and Kimi workers. Local metadata only: no host credential is read, no host is called, and opening this page makes no provider or network request.');
+    title('Host agents','The two host/controller agents that delegate to the managed Qwen and Kimi workers. Local metadata only: no host credential is read, no host is called, and opening this page makes no provider or network request.');
     const data=await get('/api/v1/hosts');
     const cards=node('div',undefined,'cards');cards.id='host-cards';
     (data.hosts||[]).forEach(host=>cards.append(hostCard(host)));
     root.append(cards);
     root.append(node('p',data.note||'','notice'));
-    root.append(node('p','Managed provider workers (Qwen and Kimi) stay on the Providers page. Host agents are the layer above them: they decide what to delegate and review the returned diff. Zorava never launches, tests, or calls a host agent, and the ChatGPT-hosted controller is roadmap only.','prose'));
+    root.append(node('p','Managed provider workers (Qwen and Kimi) stay on the Providers page. Host agents are the layer above them: two host agents coordinate two coding workers, deciding what to delegate and reviewing the returned diff. Zorava never launches, tests, or calls a host agent.','prose'));
   }
 
   async function overview() {
     title('Overview','Local worker health, active jobs, and recent outcomes.');
-    root.append(node('div','Claude stays direct to Anthropic. Delegated workers are separate CLI processes.','banner'));
+    root.append(node('div','Two host agents (Claude Code, Codex CLI) coordinate two coding workers (Qwen, Kimi). Delegated workers run as separate CLI processes in isolated worktrees.','banner'));
     const data=await get('/api/v1/status');
     const cards=node('div',undefined,'cards');cards.id='provider-cards';
-    ['claude','qwen','kimi'].forEach(name => cards.append(providerCard(data.providers[name])));
+    PROVIDER_ORDER.forEach(name => cards.append(providerCard(data.providers[name])));
     root.append(cards);
-    // Host/controller layer, kept visually separate from the managed workers.
-    root.append(hostSummary(await get('/api/v1/hosts')));
     const counts=data.counts?.today || {};
     const metrics=node('div',undefined,'metrics');
     [['Jobs today',Object.values(counts).reduce((a,b)=>a+b,0)],['Completed',counts.completed||0],['Failed',counts.failed||0],['Cancelled',counts.cancelled||0]].forEach(([label,value])=>{
@@ -423,7 +422,7 @@
   async function providersPage() {
     title('Providers','Configured provider routes and cached test status. Opening this page makes no provider calls.');
     const data=await get('/api/v1/providers');const cards=node('div',undefined,'cards');cards.id='provider-cards';
-    ['claude','qwen','kimi'].forEach(name=>cards.append(providerCard(data.providers[name])));root.append(cards);
+    PROVIDER_ORDER.forEach(name=>cards.append(providerCard(data.providers[name])));root.append(cards);
     const note=node('p','Credentials remain in their provider-owned CLI configuration. Test status refreshes automatically from local records; provider calls only run when you click Test. CLI version metadata is cached: a version source is read only when you click Check for upgrades, and this dashboard never installs an upgrade.','notice');root.append(note);
     const hostLink=node('a','Claude Code and the Codex CLI are host agents, not managed workers — see the Hosts page for the local host/controller layer.','crumb');hostLink.href='/?page=hosts';root.append(hostLink);
     const config=panel('MODEL AND ROUTING');

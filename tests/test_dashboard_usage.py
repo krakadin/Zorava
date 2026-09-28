@@ -11,6 +11,7 @@ import uuid
 
 from http.server import ThreadingHTTPServer
 
+from ai_router import hosts
 from ai_router.kimi_quota import QUOTA_REFRESH_COOLDOWN_S, QuotaCache
 from ai_router.state import StateStore
 from dashboard.server import DashboardController, make_handler, _percent
@@ -50,8 +51,15 @@ class DashboardUsageTests(unittest.TestCase):
                                       clock=lambda: self.wall[0],
                                       now=lambda: self.mono[0],
                                       spawner=lambda target: target())
+        # Host detection stays offline and deterministic in this suite too:
+        # provider/status reads include Codex from the cached host snapshot
+        # without ever resolving or executing a real host CLI.
+        resolver = patch.object(hosts, 'resolve_executable', return_value=None)
+        resolver.start()
+        self.addCleanup(resolver.stop)
         with patch.object(DashboardController, '_load_provider_snapshot', return_value=safe):
-            self.controller = DashboardController(self.runtime, port=8787, quota_cache=self.quota_cache)
+            self.controller = DashboardController(self.runtime, port=8787, quota_cache=self.quota_cache,
+                                                  host_probe=lambda executable: None)
         self.controller.provider_snapshot = safe
         self.server = ThreadingHTTPServer(('127.0.0.1', 0), make_handler(self.controller))
         self.server.daemon_threads = True
@@ -222,8 +230,9 @@ class DashboardUsageTests(unittest.TestCase):
         self.assertEqual(usage['state'], 'unavailable')
         self.assertIn('unavailable for Qwen', usage['detail'])
         self.assertNotIn('remaining_percent', json.dumps(usage))
-        # Claude has no usage section at all.
+        # Claude has no usage section at all, and neither does the Codex host card.
         self.assertNotIn('usage', json.loads(body)['providers']['claude'])
+        self.assertNotIn('usage', json.loads(body)['providers']['codex'])
         self.fetcher.assert_not_called()
 
     def test_kimi_provider_card_carries_quota_and_job_tokens(self):

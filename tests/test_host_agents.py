@@ -1,10 +1,11 @@
 """Focused tests for local host-agent detection, its dashboard API, and the UI.
 
-Host agents (Claude Code, the Codex CLI, and the planned ChatGPT-hosted
-controller) are the orchestrators above the managed Qwen/Kimi workers. These
-tests keep that separation honest: detection is local and fixed-path only, the
-dashboard route is a cached GET with no action, no host credential is read, and
-the roadmap host is reported as unavailable instead of being faked.
+Host agents (Claude Code and the Codex CLI) are the orchestrators above the
+managed Qwen/Kimi workers. These tests keep that separation honest: detection
+is local and fixed-path only, the dashboard route is a cached GET with no
+action, no host credential is read, and the host agents appear as cards beside
+(but never as) the managed workers. A hosted ChatGPT controller remains
+documentation-roadmap material only and has no runtime entry anywhere.
 """
 
 import http.client
@@ -58,10 +59,10 @@ class HostDetectionTests(unittest.TestCase):
         patcher.start()
         self.addCleanup(patcher.stop)
 
-    def test_snapshot_reports_the_three_hosts_in_a_fixed_order(self):
+    def test_snapshot_reports_the_two_hosts_in_a_fixed_order(self):
         snapshot = hosts.detect_hosts(resolver=lambda name: None, probe=RecordingProbe())
         self.assertEqual([host['id'] for host in snapshot['hosts']],
-                         ['claude-code', 'codex-cli', 'chatgpt-hosted'])
+                         ['claude-code', 'codex-cli'])
         self.assertTrue(snapshot['generated_at'])
         self.assertIn('no provider or', snapshot['note'])
 
@@ -90,29 +91,28 @@ class HostDetectionTests(unittest.TestCase):
     def test_absent_host_executable_is_not_installed_and_is_never_probed(self):
         probe = RecordingProbe()
         snapshot = hosts.detect_hosts(resolver=lambda name: None, probe=probe)
-        for host in snapshot['hosts'][:2]:
+        for host in snapshot['hosts']:
             self.assertEqual(host['status'], hosts.STATUS_NOT_INSTALLED)
             self.assertIsNone(host['executable'])
             self.assertIsNone(host['version'])
         self.assertEqual(probe.calls, [])
 
-    def test_chatgpt_host_is_roadmap_without_an_executable_or_a_probe(self):
+    def test_snapshot_has_no_roadmap_or_hosted_entries(self):
         probe = RecordingProbe()
-        snapshot = hosts.detect_hosts(resolver=lambda name: Path('/bin/never-used'), probe=probe)
-        hosted = snapshot['hosts'][2]
-        self.assertEqual(hosted['status'], hosts.STATUS_ROADMAP)
-        self.assertEqual(hosted['kind'], hosts.KIND_HOSTED)
-        self.assertIsNone(hosted['executable'])
-        self.assertIsNone(hosted['executable_name'])
-        self.assertIsNone(hosted['version'])
-        self.assertIsNone(hosted['skill_path'])
-        self.assertFalse(hosted['skill_present'])
-        self.assertEqual(hosted['skill_state'], hosts.SKILL_NOT_APPLICABLE)
-        self.assertIn('ROADMAP', hosted['detail'])
-        self.assertIn('planned', hosted['detail'])
-        # Only the two local hosts are ever resolved and probed; the roadmap
-        # entry never invents an executable or triggers a probe of its own.
-        self.assertEqual(probe.calls, [Path('/bin/never-used'), Path('/bin/never-used')])
+        snapshot = hosts.detect_hosts(resolver=lambda name: None, probe=probe)
+        # Exactly the two real local host integrations exist; a future hosted
+        # ChatGPT controller stays in documentation only and invents no entry,
+        # executable, or status of its own.
+        self.assertEqual(len(snapshot['hosts']), 2)
+        for host in snapshot['hosts']:
+            self.assertEqual(host['kind'], hosts.KIND_LOCAL_CLI)
+            self.assertIn(host['status'], (hosts.STATUS_LOCAL, hosts.STATUS_NOT_INSTALLED))
+            self.assertTrue(host['executable_name'])
+        raw = json.dumps(snapshot).lower()
+        self.assertNotIn('chatgpt-hosted', raw)
+        self.assertNotIn('roadmap', raw)
+        self.assertNotIn('hosted', raw)
+        self.assertEqual(probe.calls, [])
 
     def test_resolver_refuses_names_outside_the_fixed_allowlist(self):
         self.assertEqual(hosts.ALLOWED_EXECUTABLES, frozenset({'claude', 'codex'}))
@@ -455,17 +455,13 @@ class HostApiTests(unittest.TestCase):
         self.assertEqual(status, 200)
         payload = json.loads(body)
         by_id = {host['id']: host for host in payload['hosts']}
-        self.assertEqual(list(by_id), ['claude-code', 'codex-cli', 'chatgpt-hosted'])
+        self.assertEqual(list(by_id), ['claude-code', 'codex-cli'])
         self.assertEqual(by_id['claude-code']['status'], 'LOCAL')
         self.assertEqual(by_id['claude-code']['version'], '2.1.3')
         self.assertEqual(by_id['claude-code']['role'], 'Host and controller')
         self.assertEqual(by_id['codex-cli']['status'], 'LOCAL')
         self.assertEqual(by_id['codex-cli']['skill_path'], str(CODEX_SKILL))
         self.assertTrue(by_id['codex-cli']['skill_present'])
-        self.assertEqual(by_id['chatgpt-hosted']['status'], 'ROADMAP')
-        self.assertIsNone(by_id['chatgpt-hosted']['executable'])
-        self.assertIsNone(by_id['chatgpt-hosted']['version'])
-        self.assertIn('planned', by_id['chatgpt-hosted']['detail'])
         # No managed worker is mixed into the host view.
         self.assertNotIn('qwen', body)
         self.assertNotIn('kimi', body)
@@ -484,6 +480,108 @@ class HostApiTests(unittest.TestCase):
             status, _ = self.request('GET', '/api/v1/hosts')
         self.assertEqual(status, 200)
         load.assert_not_called()
+
+    @staticmethod
+    def safe_provider_snapshot():
+        """Offline provider fixture; real adapter/CLI loading is never run."""
+        return {'claude': {'worker': 'claude', 'status': 'CONFIGURED',
+                           'requested_model': 'claude-local', 'provider': 'Anthropic',
+                           'endpoint_host': 'api.anthropic.com',
+                           'authentication': 'Claude Code-managed Max OAuth; not tested by ai-worker',
+                           'routing': 'DIRECT'},
+                'qwen': {'worker': 'qwen', 'status': 'CONFIGURED', 'requested_model': 'qwen-test',
+                         'provider': 'Token Plan', 'endpoint_host': 'token-plan.example',
+                         'endpoint_url': 'https://token-plan.example/v1',
+                         'authentication': 'credential present', 'version': '1.2.3'},
+                'kimi': {'worker': 'kimi', 'status': 'CONFIGURED', 'requested_model': 'kimi-test',
+                         'provider': 'Kimi', 'endpoint_host': 'api.kimi.example',
+                         'authentication': 'OAuth', 'version': '2.3.4'}}
+
+    def test_providers_and_status_include_codex_cached_host_metadata(self):
+        with patch.object(DashboardController, '_load_provider_snapshot',
+                          return_value=self.safe_provider_snapshot()):
+            for endpoint in ('/api/v1/providers', '/api/v1/status'):
+                status, body = self.request('GET', endpoint)
+                self.assertEqual(status, 200)
+                providers = json.loads(body)['providers']
+                self.assertEqual(list(providers), ['claude', 'codex', 'qwen', 'kimi'])
+                codex = providers['codex']
+                self.assertEqual(codex['worker'], 'codex')
+                self.assertEqual(codex['name'], 'Codex CLI')
+                self.assertTrue(codex['host'])
+                self.assertEqual(codex['role'], 'Host and controller')
+                self.assertEqual(codex['status'], 'LOCAL')
+                self.assertEqual(codex['provider'], 'OpenAI')
+                self.assertEqual(codex['executable'], '/home/krakadin/.local/bin/codex')
+                self.assertEqual(codex['version'], '0.156.1')
+                self.assertEqual(codex['skill_path'], str(CODEX_SKILL))
+                self.assertEqual(codex['skill_state'], hosts.SKILL_DETECTED)
+                self.assertIn('Codex CLI', codex['authentication'])
+                self.assertIn('Codex CLI', codex['routing'])
+                # No invented model, login, test, usage, quota, capacity, or
+                # upgrade values, and no worker-only suffix on the host role.
+                self.assertIsNone(codex['requested_model'])
+                self.assertNotIn('separate worktree', codex['role'])
+                for absent in ('usage', 'concurrency', 'update_state', 'last_test_at',
+                               'last_test_status', 'queued_jobs', 'running_jobs'):
+                    self.assertNotIn(absent, codex)
+                # Claude keeps its existing model/routing fields and gains the
+                # same cached local metadata.
+                claude = providers['claude']
+                self.assertEqual(claude['name'], 'Claude Code')
+                self.assertTrue(claude['host'])
+                self.assertEqual(claude['role'], 'Host and controller')
+                self.assertEqual(claude['requested_model'], 'claude-local')
+                self.assertEqual(claude['routing'], 'DIRECT')
+                self.assertEqual(claude['provider'], 'Anthropic')
+                self.assertEqual(claude['executable'], '/home/krakadin/.local/bin/claude')
+                self.assertEqual(claude['version'], '2.1.3')
+                self.assertEqual(claude['skill_path'],
+                                 '/home/krakadin/.claude/skills/delegate-workers/SKILL.md')
+                self.assertNotIn('separate worktree', claude['role'])
+
+    def test_providers_report_codex_missing_installation_honestly(self):
+        with patch.object(hosts, 'resolve_executable', return_value=None), \
+             patch.object(DashboardController, '_load_provider_snapshot',
+                          return_value=self.safe_provider_snapshot()):
+            self.controller.host_snapshot = None
+            for endpoint in ('/api/v1/providers', '/api/v1/status'):
+                status, body = self.request('GET', endpoint)
+                self.assertEqual(status, 200)
+                providers = json.loads(body)['providers']
+                codex = providers['codex']
+                self.assertEqual(codex['status'], hosts.STATUS_NOT_INSTALLED)
+                self.assertIsNone(codex['executable'])
+                self.assertIsNone(codex['version'])
+                self.assertEqual(codex['provider'], 'OpenAI')
+                # The card is present but never faked as healthy or logged in.
+                self.assertNotIn('usage', codex)
+                self.assertNotIn('update_state', codex)
+
+    def test_host_detection_is_cached_across_provider_polls(self):
+        with patch.object(DashboardController, '_load_provider_snapshot',
+                          return_value=self.safe_provider_snapshot()):
+            self.request('GET', '/api/v1/providers')
+            self.request('GET', '/api/v1/providers')
+            self.request('GET', '/api/v1/status')
+            self.request('GET', '/api/v1/hosts')
+        # One bounded probe per local host for the whole controller lifetime.
+        self.assertEqual(len(self.probe.calls), 2)
+        self.assertIsNotNone(self.controller.host_snapshot)
+
+    def test_worker_actions_stay_restricted_to_qwen_and_kimi(self):
+        for path in ('/api/v1/test/codex', '/api/v1/test/claude',
+                     '/api/v1/test/chatgpt'):
+            self.assertEqual(self.request('POST', path, body='{}',
+                                          headers=self.csrf_headers())[0], 404)
+        for payload in ('{"workers":["codex"]}', '{"workers":["claude"]}'):
+            status, body = self.request('POST', '/api/v1/updates/check', body=payload,
+                                        headers=self.csrf_headers())
+            self.assertEqual(status, 400, body)
+        for worker in ('codex', 'claude'):
+            with self.subTest(worker=worker):
+                with self.assertRaises(ValueError):
+                    self.controller.start_test(worker)
 
     def test_host_detection_module_has_no_network_or_credential_client(self):
         source = (ROOT / 'ai_router' / 'hosts.py').read_text(encoding='utf-8')
@@ -537,13 +635,28 @@ class HostUiTests(unittest.TestCase):
         self.assertIn('textContent', self.js)
         self.assertNotIn('innerHTML', self.js)
 
-    def test_overview_keeps_host_agents_separate_from_worker_cards(self):
-        self.assertIn("panel('HOST AGENTS')", self.js)
-        self.assertIn("root.append(hostSummary(await get('/api/v1/hosts')));", self.js)
-        # The managed provider worker cards are unchanged.
-        self.assertIn("['claude','qwen','kimi'].forEach(name => cards.append(providerCard(data.providers[name])));",
+    def test_overview_and_providers_share_one_four_card_order(self):
+        # One shared display order drives the initial Overview and Providers
+        # renders and every refresh path, so the Codex card never disappears
+        # on a poll: two host agents first, then the two managed workers.
+        self.assertIn("const PROVIDER_ORDER=['claude','codex','qwen','kimi'];", self.js)
+        self.assertIn('PROVIDER_ORDER.forEach(name => cards.append(providerCard(data.providers[name])));',
                       self.js)
+        self.assertIn('PROVIDER_ORDER.forEach(name=>cards.append(providerCard(data.providers[name])));',
+                      self.js)
+        self.assertIn('cards.replaceChildren(...PROVIDER_ORDER.map(name=>providerCard(data.providers[name])))',
+                      self.js)
+        self.assertNotIn("['claude','qwen','kimi']", self.js)
         self.assertIn("dataset.action='test'", self.js)
+
+    def test_host_provider_cards_show_metadata_without_worker_actions(self):
+        self.assertIn('const isHost = info.host === true;', self.js)
+        self.assertIn("info.name || (info.worker || '').toUpperCase()", self.js)
+        self.assertIn("isHost ? info.role : `${info.role} · separate worktree`", self.js)
+        self.assertIn("'Not detected on this machine'", self.js)
+        # Test/upgrade/usage actions stay gated on the two managed workers.
+        self.assertIn("if (info.worker === 'qwen' || info.worker === 'kimi') {", self.js)
+        self.assertIn("if (info.usage) card.append(usageSection(info));", self.js)
 
     def test_host_section_offers_no_action_and_no_post(self):
         self.assertNotIn("post('/api/v1/hosts", self.js)
@@ -551,14 +664,15 @@ class HostUiTests(unittest.TestCase):
         self.assertNotIn("dataset.action='refresh-host", self.js)
         self.assertNotIn('fetch(\'/api/v1/hosts\',{method', self.js)
 
-    def test_roadmap_host_is_shown_as_planned_not_faked(self):
-        self.assertIn("host.status === 'ROADMAP'", self.js)
-        self.assertIn('Planned hosted controller', self.js)
-        self.assertIn('None · hosted integration is planned', self.js)
-        self.assertIn('host-roadmap', self.js)
+    def test_no_roadmap_host_remains_in_the_ui(self):
+        for text in ('ROADMAP', 'host-roadmap', 'Planned hosted controller',
+                     'hosted integration is planned', 'ChatGPT', 'hostSummary',
+                     "panel('HOST AGENTS')"):
+            self.assertNotIn(text, self.js)
+        self.assertNotIn('host-roadmap', self.css)
+        self.assertNotIn('status-roadmap', self.css)
         self.assertIn('.cards .card.host-card', self.css)
-        self.assertIn('.cards .card.host-card.host-roadmap', self.css)
-        self.assertIn('.status.status-roadmap', self.css)
+        self.assertIn('.status.status-local', self.css)
         self.assertIn('.status.status-not_installed', self.css)
 
 

@@ -14,6 +14,7 @@ import uuid
 
 from http.server import ThreadingHTTPServer
 
+from ai_router import hosts
 from ai_router import updates
 from ai_router.request import DEFAULT_TIMEOUT, MAX_TIMEOUT
 from ai_router.settings import (load_settings, load_worker_concurrency, load_worker_model_profile,
@@ -48,8 +49,12 @@ class DashboardTests(unittest.TestCase):
                       'endpoint_host':'token-plan.example','endpoint_url':'https://token-plan.example/v1','authentication':'credential present','version':'1.2.3'},
               'kimi':{'worker':'kimi','status':'CONFIGURED','requested_model':'kimi-test','provider':'Kimi','endpoint_host':'api.kimi.example','authentication':'OAuth','version':'2.3.4'}}
         self.safe_provider_snapshot=safe
+        # Host detection stays offline and deterministic: no real executable
+        # resolution and no real host CLI probe from these dashboard tests.
+        resolver=patch.object(hosts,'resolve_executable',return_value=None)
+        resolver.start();self.addCleanup(resolver.stop)
         with patch.object(DashboardController,'_load_provider_snapshot',return_value=safe):
-            self.controller=DashboardController(self.runtime,port=8787)
+            self.controller=DashboardController(self.runtime,port=8787,host_probe=lambda executable: None)
         self.controller.provider_snapshot=safe
         self.server=ThreadingHTTPServer(('127.0.0.1',0),make_handler(self.controller))
         self.server.daemon_threads=True
@@ -121,6 +126,9 @@ class DashboardTests(unittest.TestCase):
     def test_provider_and_settings_api_are_safe_and_cached(self):
         status,_,body=self.request('GET','/api/v1/providers')
         self.assertEqual(status,200);data=json.loads(body)
+        self.assertEqual(sorted(data['providers']),['claude','codex','kimi','qwen'])
+        self.assertEqual(data['providers']['codex']['status'],hosts.STATUS_NOT_INSTALLED)
+        self.assertTrue(data['providers']['codex']['host'])
         self.assertEqual(data['providers']['qwen']['requested_model'],'qwen-test')
         self.assertEqual(data['providers']['qwen']['endpoint_url'],'https://token-plan.example/v1')
         status,_,body=self.request('GET','/api/v1/settings')
@@ -652,6 +660,7 @@ class DashboardTests(unittest.TestCase):
                 self.assertIsNone(info['last_update_success_at'])
                 self.assertIsNone(info['last_update_error'])
             self.assertNotIn('update_state',providers['claude'])
+            self.assertNotIn('update_state',providers['codex'])
         # Reading provider state never contacts a version source.
         self.assertEqual(fetcher.calls,[])
 
